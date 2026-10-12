@@ -1,0 +1,7 @@
+# Veda-on-ComfyUI 一键搭建脚本 · 行尾固化
+# 跨平台硬伤：.sh 带 CRLF 在 Linux/macOS 报 bad interpreter，.bat 需 CRLF 避免 Windows 解析异常
+*.sh   text eol=lf
+*.bat  text eol=crlf
+*.py   text eol=lf
+*.json text eol=lf
+*.md   text eol=lf

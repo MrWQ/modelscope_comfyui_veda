@@ -1,0 +1,101 @@
+{
+  "schema": "veda-assets/v1",
+  "note": "repo 类资产锁定 commit/tag 防上游破坏（见 §9.1）。comfyui/veda 已回填验证存在的真实 commit（2026-10）。MiniMax-H3 加载器走 ComfyUI 原生（Comfy-Org/MiniMax-H3 官方带 comfyui 标签），不单独 clone 第三方加载器节点（Comfy-Org/ComfyUI-MiniMaxH3 经核实不存在，404）。模型权重以文件名+min_bytes+头部校验保证；min_bytes 为真实文件大小的安全下界（已按魔搭官方清单校准，非估算）。",
+  "repos": [
+    {
+      "id": "comfyui",
+      "title": "ComfyUI 本体",
+      "url": "https://github.com/comfyanonymous/ComfyUI.git",
+      "commit": "7f7fd918ed0815c5d5ef2ccfe44bfc8e72cfd217",
+      "min_version": "0.38.0"
+    },
+    {
+      "id": "veda",
+      "title": "Veda-on-ComfyUI 加速节点（MODEL in->out）",
+      "url": "https://github.com/veda-sparse/Veda-on-ComfyUI.git",
+      "commit": "67e4eb5541b648555563144401ebaba832bd73ec"
+    }
+  ],
+  "assets": [
+    {
+      "id": "veda-predictor-t2va",
+      "title": "Veda 预测器 T2VA/FL2VA (~262MB)",
+      "target": "ComfyUI/models/veda/minimax_h3_t2va_veda_8nfe_600step_preview_fp8.safetensors",
+      "min_bytes": 262144000,
+      "sources": [
+        {"type": "modelscope", "repo": "Veda-Sparse/Minimax-H3-T2VA-Veda-8NFE-600Step-Preview", "file": "minimax_h3_t2va_veda_8nfe_600step_preview_fp8.safetensors"},
+        {"type": "hf", "repo": "Veda-Sparse/Minimax-H3-T2VA-Veda-8NFE-600Step-Preview", "file": "minimax_h3_t2va_veda_8nfe_600step_preview_fp8.safetensors", "endpoint": "https://hf-mirror.com"}
+      ]
+    },
+    {
+      "id": "veda-predictor-r2va",
+      "title": "Veda 预测器 R2VA (~262MB, full 档)",
+      "target": "ComfyUI/models/veda/minimax_h3_r2va_veda_preview_fp8.safetensors",
+      "min_bytes": 262144000,
+      "sources": [
+        {"type": "modelscope", "repo": "Veda-Sparse/Minimax-H3-R2VA-Veda-Preview", "file": "minimax_h3_r2va_veda_preview_fp8.safetensors"},
+        {"type": "hf", "repo": "Veda-Sparse/Minimax-H3-R2VA-Veda-Preview", "file": "minimax_h3_r2va_veda_preview_fp8.safetensors", "endpoint": "https://hf-mirror.com"}
+      ]
+    },
+    {
+      "id": "h3-dit-int8",
+      "title": "MiniMax-H3 DiT (int8_convrot, ~19.5GB)",
+      "target": "ComfyUI/models/diffusion_models/minimax_h3_fl2va_pruned_int8_convrot.safetensors",
+      "min_bytes": 18000000000,
+      "sources": [
+        {"type": "modelscope", "repo": "Comfy-Org/MiniMax-H3", "include": "diffusion_models/minimax_h3_fl2va_pruned_int8_convrot.safetensors"},
+        {"type": "hf", "repo": "Comfy-Org/MiniMax-H3", "include": "diffusion_models/minimax_h3_fl2va_pruned_int8_convrot.safetensors", "endpoint": "https://hf-mirror.com"}
+      ]
+    },
+    {
+      "id": "h3-te-nvfp4",
+      "title": "MiniMax-H3 文本编码器 (qwen3vl_32b nvfp4 awq, ~14.6GB)",
+      "target": "ComfyUI/models/text_encoders/qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors",
+      "min_bytes": 14000000000,
+      "sources": [
+        {"type": "modelscope", "repo": "Comfy-Org/MiniMax-H3", "include": "text_encoders/qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors"},
+        {"type": "hf", "repo": "Comfy-Org/MiniMax-H3", "include": "text_encoders/qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors", "endpoint": "https://hf-mirror.com"}
+      ]
+    },
+    {
+      "id": "h3-te-awq",
+      "title": "MiniMax-H3 文本编码器 (nvfp4 awq, lowvram 同款官方量化)",
+      "target": "ComfyUI/models/text_encoders/qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors",
+      "min_bytes": 14000000000,
+      "sources": [
+        {"type": "modelscope", "repo": "Comfy-Org/MiniMax-H3", "include": "text_encoders/qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors"},
+        {"type": "hf", "repo": "Comfy-Org/MiniMax-H3", "include": "text_encoders/qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors", "endpoint": "https://hf-mirror.com"}
+      ]
+    },
+    {
+      "id": "h3-vae-audio",
+      "title": "MiniMax-H3 音频 VAE (fp32, ~0.56GB)",
+      "target": "ComfyUI/models/vae/minimax_h3_audio_vae_fp32.safetensors",
+      "min_bytes": 500000000,
+      "sources": [
+        {"type": "modelscope", "repo": "Comfy-Org/MiniMax-H3", "include": "vae/minimax_h3_audio_vae_fp32.safetensors"},
+        {"type": "hf", "repo": "Comfy-Org/MiniMax-H3", "include": "vae/minimax_h3_audio_vae_fp32.safetensors", "endpoint": "https://hf-mirror.com"}
+      ]
+    },
+    {
+      "id": "h3-vae-video",
+      "title": "MiniMax-H3 视频 VAE (fp16, ~4.85GB)",
+      "target": "ComfyUI/models/vae/minimax_h3_video_vae_fp16.safetensors",
+      "min_bytes": 4600000000,
+      "sources": [
+        {"type": "modelscope", "repo": "Comfy-Org/MiniMax-H3", "include": "vae/minimax_h3_video_vae_fp16.safetensors"},
+        {"type": "hf", "repo": "Comfy-Org/MiniMax-H3", "include": "vae/minimax_h3_video_vae_fp16.safetensors", "endpoint": "https://hf-mirror.com"}
+      ]
+    },
+    {
+      "id": "h3-turbo-lora",
+      "title": "MiniMax-H3 8步 Turbo LoRA (~1.82GB)",
+      "target": "ComfyUI/models/loras/minimax_h3_fl2v_turbo_8step_v1.0_comfyui_bf16.safetensors",
+      "min_bytes": 1700000000,
+      "sources": [
+        {"type": "modelscope", "repo": "Comfy-Org/MiniMax-H3", "include": "loras/minimax_h3_fl2v_turbo_8step_v1.0_comfyui_bf16.safetensors"},
+        {"type": "hf", "repo": "Comfy-Org/MiniMax-H3", "include": "loras/minimax_h3_fl2v_turbo_8step_v1.0_comfyui_bf16.safetensors", "endpoint": "https://hf-mirror.com"}
+      ]
+    }
+  ]
+}

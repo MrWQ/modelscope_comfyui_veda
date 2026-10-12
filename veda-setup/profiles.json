@@ -1,0 +1,31 @@
+{
+  "schema": "veda-profiles/v1",
+  "default_auto": true,
+  "profiles": {
+    "minimal": {
+      "desc": "最小：仅 Veda 加速节点 + 预测器，不含主模型（--skip-models 默认生效）",
+      "models": false,
+      "vram_min_gb": 12,
+      "asset_ids": ["veda-predictor-t2va"]
+    },
+    "standard": {
+      "desc": "标准：int8 DiT + 32B nvfp4 编码器（A10 24GB 适配，约 55GB；VRAM 可行性假设 A1，待 M4/G6 实测）",
+      "models": true,
+      "vram_min_gb": 16,
+      "asset_ids": ["veda-predictor-t2va", "h3-dit-int8", "h3-te-nvfp4", "h3-vae-audio", "h3-vae-video", "h3-turbo-lora"]
+    },
+    "full": {
+      "desc": "完整：最高画质权重，需 VRAM > 24GB",
+      "models": true,
+      "vram_min_gb": 24,
+      "asset_ids": ["veda-predictor-t2va", "veda-predictor-r2va", "h3-dit-int8", "h3-te-nvfp4", "h3-vae-audio", "h3-vae-video", "h3-turbo-lora"]
+    },
+    "lowvram": {
+      "desc": "低显存（8-16GB）：第三方量化权重（需 --accept-third-party）",
+      "models": true,
+      "vram_min_gb": 8,
+      "require_third_party": true,
+      "asset_ids": ["veda-predictor-t2va", "h3-dit-int8", "h3-te-awq", "h3-vae-audio", "h3-vae-video", "h3-turbo-lora"]
+    }
+  }
+}
