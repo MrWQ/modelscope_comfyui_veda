@@ -2,7 +2,7 @@
 
 在魔搭社区（ModelScope）免费 Notebook 等环境**一键部署 Veda-on-ComfyUI**（MiniMax-H3 视频扩散模型的官方加速节点，学习型稀疏注意力，约 3× 提速）。
 
-> 设计文档：`docs/Veda一键脚本设计文档.md`（v2.3.6）。本脚本严格按设计文档实现：多平台、持久化免重装、**安装/启动自动分流**、全自动、优先魔搭下载能力、结构化日志 + 诊断包。
+> 设计文档：`docs/Veda一键脚本设计文档.md`（v2.3.7）。本脚本严格按设计文档实现：多平台、持久化免重装、**安装/启动自动分流**、全自动、优先魔搭下载能力、结构化日志 + 诊断包；v2.3.7 含首次魔搭实例实测反馈修复（模型下载落点 / hf 兜底源链 / 阶段级快速跳过 / `--only` 单环节执行）。
 
 📚 配套文档：**使用说明** `docs/使用说明.md` ｜ **问题排错** `docs/问题排错.md`
 
@@ -43,6 +43,7 @@ bash install.sh   # 走 MLX 后端，模型权重以 ComfyUI 官方支持为准
 |---|---|---|
 | `--install-root PATH` | 安装根目录 | 自动探测（魔搭 → `/mnt/workspace/comfyui-veda`） |
 | `--mode NAME` | 运行模式：`auto`=自动判定（已安装仅启动 / 未安装安装+启动）；`install`=强制安装段（幂等增量）；`launch`=强制仅启动 | `auto` |
+| `--only pN[,pN]` | 单环节执行：`--only p5` 补模型、`--only p1,p3` 重装 ComfyUI+节点；P0 前置、不改 `install_completed`、未含 p8 不启动 | 无 |
 | `--profile NAME` | `minimal`/`standard`/`full`/`lowvram`/`auto` | `auto`（按实测 VRAM 选） |
 | `--skip-models` | 只搭环境不下模型 | false |
 | `--keep-cache` | 下载后保留模型缓存（默认清理省磁盘） | false |
@@ -62,7 +63,7 @@ python setup_veda.py --doctor
 ```
 把生成的 `logs/diagnose_*.tar.gz`（Windows 为 `.zip`）附上提 issue 即可，无需手动收集信息。
 
-常见错误码：`E102` GPU 算力不足；`E104` 磁盘不足（会自动降档）；`E201` ComfyUI 下载失败（GitHub 不可达，检查 gh-proxy）；`E401` 模型资产下载失败；`E603` 并发锁冲突（删除残留 `.setup.lock` 或等待另一安装）；`E701` 显式 `--mode launch` 但安装未完成（去掉该参数即可，auto 会自动安装/修复）。
+常见错误码：`E102` GPU 算力不足；`E104` 磁盘不足（会自动降档）；`E201` ComfyUI 下载失败（GitHub 不可达，检查 gh-proxy）；`E401` 模型资产下载失败（重跑续传或 `--only p5` 单补模型；历史落点 bug 已在 v2.3.7 修复并自动回收错位文件）；`E603` 并发锁冲突（删除残留 `.setup.lock` 或等待另一安装）；`E701` 显式 `--mode launch` 但安装未完成（去掉该参数即可，auto 会自动安装/修复）。失败重跑很快：已对齐锁定 commit 的环节（P1/P3）零网络操作直接跳过，仅补真正缺失项。
 
 > 完整错误码表、按阶段排错、网络/磁盘/GPU/锁/校验等专项排查，见 **`docs/问题排错.md`**。
 

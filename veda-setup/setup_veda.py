@@ -3,11 +3,11 @@
 """Veda-on-ComfyUI 一键搭建 · 主驱动（跨平台，仅标准库）。
 
 人工唯一入口：python setup_veda.py （或经 install.sh / install.bat）。
-设计文档：docs/Veda一键脚本设计文档.md（v2.3.6）。
+设计文档：docs/Veda一键脚本设计文档.md（v2.3.7）。
 
 运行模式（M0，默认 auto）：自动判定是否已安装——
 已安装实例仅启动（跳过 P1–P7 安装段）；未安装则安装+启动。
-可用 --mode install / --mode launch 显式控制。
+可用 --mode install / --mode launch 显式控制；--only pN[,pN] 单环节执行。
 """
 from __future__ import annotations
 
@@ -42,6 +42,10 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--mode", choices=["auto", "install", "launch"], default="auto",
                    help="运行模式：auto=自动判定(默认，已安装仅启动/未安装安装+启动)；"
                         "install=强制进入安装段（幂等增量）；launch=强制仅启动（未完成报 E701）")
+    p.add_argument("--only", metavar="pN[,pN]",
+                   help="仅执行指定安装环节（v2.3.7）：p1–p7 逗号分隔，如 --only p5（补模型）"
+                        "或 --only p1,p3（重装 ComfyUI+节点）；P0 预检始终前置；"
+                        "install_completed 不变更；未含 p8 则不启动")
     p.add_argument("--profile", default="auto",
                    help="minimal/standard/full/lowvram/auto")
     p.add_argument("--source-priority", default="auto",
@@ -67,6 +71,27 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--log-dir", help="日志目录（默认 <root>/logs）")
     p.add_argument("--force", action="store_true", help="覆盖外来 ComfyUI 检测")
     return p.parse_args()
+
+
+def parse_only_spec(spec: str) -> set:
+    """解析 --only 参数（v2.3.7）：'p5' / '5' / 'p1,p3' → {5} / {1,3}。
+
+    合法环节 1–7（p8 由启动逻辑单独处理：含 8 时执行后启动）；非法值抛 ValueError。
+    """
+    out = set()
+    for tok in spec.replace(" ", "").split(","):
+        if not tok:
+            continue
+        t = tok.lower().lstrip("p")
+        if not t.isdigit():
+            raise ValueError(f"无法识别的环节：{tok}（应为 p1–p8）")
+        n = int(t)
+        if not 1 <= n <= 8:
+            raise ValueError(f"环节超出范围：{tok}（应为 p1–p8）")
+        out.add(n)
+    if not out:
+        raise ValueError("--only 为空")
+    return out
 
 
 def resolve_root(args: argparse.Namespace) -> str:
@@ -183,8 +208,44 @@ def main() -> int:
                   "is_modelscope": env["is_modelscope"], "source_priority": args.source_priority}
 
     try:
+        # --only 单环节执行（v2.3.7）：跳过 M0 分流，强制安装段路径但仅执行指定环节
+        only_set = parse_only_spec(args.only) if args.only else None
+    except ValueError as e:
+        logger.error("INIT", "args", str(e))
+        print(f"参数错误：{e}")
+        return 1
+    if only_set and args.mode == "launch":
+        logger.warn("M0", "mode", "--only 与 --mode launch 同用，以 --only 为准（走安装段指定环节）")
+
+    try:
         # M0 运行模式判定（§8）：先读 state，再决定 install / launch
         ctx.state.load()
+
+        if only_set:
+            logger.info("M0", "mode", "MODE_DECISION",
+                        detail={"decision": "install-partial",
+                                "reason": f"--only {','.join('p%d' % n for n in sorted(only_set))}",
+                                "forced": args.mode, "is_installed": None})
+            if args.dry_run:
+                phases.phase0_preflight(ctx)
+                print(f"\n[DRY-RUN] 安装根={root}  模式=install-partial（--only "
+                      f"{','.join('p%d' % n for n in sorted(only_set))}）")
+                print(f"[DRY-RUN] 选定 Profile={ctx.profile_name}  魔搭={env['is_modelscope']}"
+                      f"  源链={ctx.network_table}")
+                print(f"[DRY-RUN] 将执行：P0 预检 → "
+                      f"{' → '.join('P%d' % n for n in sorted(only_set))}"
+                      + (" → P8 启动" if 8 in only_set else "（不含 P8，不启动）"))
+                return 0
+            phases.phase0_preflight(ctx)
+            phases.run_install(ctx, only=only_set)
+            if 8 in only_set and not args.no_launch:
+                phases.phase8_launch(ctx)
+            else:
+                logger.info("P8", "skip", "--only 未包含 p8（或 --no-launch），不启动")
+            logger.rotate()
+            phases.final_summary(ctx, f"install-partial：--only {','.join('p%d' % n for n in sorted(only_set))}")
+            return 0
+
         mode = phases.decide_mode(ctx)
 
         if args.dry_run:

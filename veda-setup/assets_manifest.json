@@ -19,9 +19,9 @@
   "assets": [
     {
       "id": "veda-predictor-t2va",
-      "title": "Veda 预测器 T2VA/FL2VA (~262MB)",
+      "title": "Veda 预测器 T2VA/FL2VA (275,415,648B 魔搭实测)",
       "target": "ComfyUI/models/veda/minimax_h3_t2va_veda_8nfe_600step_preview_fp8.safetensors",
-      "min_bytes": 262144000,
+      "min_bytes": 275000000,
       "sources": [
         {"type": "modelscope", "repo": "Veda-Sparse/Minimax-H3-T2VA-Veda-8NFE-600Step-Preview", "file": "minimax_h3_t2va_veda_8nfe_600step_preview_fp8.safetensors"},
         {"type": "hf", "repo": "Veda-Sparse/Minimax-H3-T2VA-Veda-8NFE-600Step-Preview", "file": "minimax_h3_t2va_veda_8nfe_600step_preview_fp8.safetensors", "endpoint": "https://hf-mirror.com"}
@@ -29,9 +29,9 @@
     },
     {
       "id": "veda-predictor-r2va",
-      "title": "Veda 预测器 R2VA (~262MB, full 档)",
+      "title": "Veda 预测器 R2VA (275,415,752B 魔搭实测, full 档)",
       "target": "ComfyUI/models/veda/minimax_h3_r2va_veda_preview_fp8.safetensors",
-      "min_bytes": 262144000,
+      "min_bytes": 275000000,
       "sources": [
         {"type": "modelscope", "repo": "Veda-Sparse/Minimax-H3-R2VA-Veda-Preview", "file": "minimax_h3_r2va_veda_preview_fp8.safetensors"},
         {"type": "hf", "repo": "Veda-Sparse/Minimax-H3-R2VA-Veda-Preview", "file": "minimax_h3_r2va_veda_preview_fp8.safetensors", "endpoint": "https://hf-mirror.com"}

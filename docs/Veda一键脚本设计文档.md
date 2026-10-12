@@ -2,9 +2,9 @@
 
 | 项目 | 内容 |
 |---|---|
-| 文档版本 | v2.3.6（v2.3.5 + **M6 代码实现落地**：`--mode` 参数、M0 判定、`install_completed` 标志（含进入安装段时复位规则补充）、launch 轻量预检（只读）、E701、`MODE_DECISION` 事件均已按设计实现并通过本地校验；使用说明/问题排错/README 已同步） |
+| 文档版本 | v2.3.7（v2.3.6 + **首次魔搭实例实测反馈修复**：① P5 修复 Veda 预测器下载落点 bug——`file` 型源（仓库根裸文件名）必须以 `--local_dir=<target 父目录>` 下载，`include` 型源（带子目录路径）以 `--local_dir=<root>/ComfyUI/models` 下载，并回收迁移旧版本错位文件；② hf 兜底端点修正——魔搭内 hf 兜底优先 hf-mirror（实测可达），gh-proxy 代理 HF 仅作末位 best-effort；③ P1/P3 增加阶段级快速跳过（git HEAD == 锁定 commit 即跳过，不再重复 fetch）；④ 新增 `--only pN[,pN]` 单环节执行（P0 始终前置，install_completed 不变更） |
 | 日期 | 2026-10-12 |
-| 状态 | 设计定稿（假设已清零：G1–G3 / F11 / F17 / F18 / F19 已实测确认；G4–G7 为运行时探测项，非设计层假设）；v2.3.5 设计的安装/启动分离已随 v2.3.6 完成代码实现（M6 ✅） |
+| 状态 | 设计定稿（假设已清零：G1–G3 / F11 / F17 / F18 / F19 已实测确认；G4–G7 为运行时探测项，非设计层假设）；v2.3.5 安装/启动分离已随 v2.3.6 完成代码实现（M6 ✅）；v2.3.7 为首次魔搭实例实测反馈修复（E401 落点/源链 + 阶段级快速跳过 + `--only`），代码随本版同步实现 |
 | 关联文档 | 评审与优化建议见 `docs/设计方案评审与优化建议.md` |
 | 首选部署目标 | **魔搭社区（ModelScope）Notebook 免费实例**，持久化目录 `/mnt/workspace` |
 | 本地开发工作区 | `D:/ai_desktop_project/buddy/modelscope_comfyui` |
@@ -89,7 +89,7 @@
 | 魔搭持久化目录 | 根目录自动探测 `/mnt/workspace`；**ComfyUI、venv、模型、节点、状态文件、日志全部落安装根内**；pip 缓存与 ModelScope 缓存也重定向到持久盘 |
 | 关机不丢/新实例免重装 | 状态文件 `<root>/.setup-state.json` **以单资产为最小粒度**记录完成态与指纹；重跑即幂等恢复：已完成的全跳过，只补缺失部分；venv 失效（如镜像 Python 版本变化）才重建；**魔搭环境下 venv 与代码同样落 `/mnt/workspace`，`--local-code` 强制关，避免本地盘关机清空导致每次重建（E3，见 §6 规则7）** |
 | 全自动零人工 | 默认非交互；License 自动接受（记入日志，`--interactive` 可退回人工确认）；体积确认、目录采用、覆盖备份全部有默认行为；失败时给出唯一错误码 + 诊断包路径 |
-| 优先魔搭能力 | 模型下载第一源为 ModelScope CLI（`pip install modelscope` 按需）；镜像预装 torch 直接复用；**源链自适应**（P0 探测 egress）：魔搭实例内 huggingface 受限（F17），源链自动排除 hf-mirror/huggingface，改为 `modelscope → github(gh-proxy) → codeload(末位)`；通用环境为 `modelscope → hf-mirror → huggingface`（E5/E6，详见 §9） |
+| 优先魔搭能力 | 模型下载第一源为 ModelScope CLI（`pip install modelscope` 按需）；镜像预装 torch 直接复用；**源链自适应**（P0 探测 egress）：魔搭实例内 huggingface.co 直连受限（F17，2026-10-12 实测）但 hf-mirror 可达——模型源链 `modelscope → hf-mirror → gh-proxy 代理 HF(末位)`、代码源链 `github 直连(首位) → gh-proxy → codeload(末位)`；通用环境为 `modelscope → hf-mirror → huggingface`（E5/E6，详见 §9） |
 | 日志与定位 | JSONL 结构化日志 + 控制台镜像；错误码注册表；`--doctor` 一键生成诊断包（环境快照+日志+资产指纹+网络探测） |
 | 健壮性（v2.3 增强） | **降级链优先于失败**：每个外部依赖都有 Plan B（见 §5、§10）；并发锁含 **stale PID 检测自动释放**（避免崩溃后死锁）；per-asset 断点续传；GitHub 类源统一走**多候选可达代理**（gh-proxy.com 等，E6） |
 | 安装/启动分离 + 已安装自动判定（v2.3.5） | 单一命令 `auto` 模式：据 `.setup-state.json` 的 `install_completed` 标志 + 目录存在性自动判定「已安装」→ 仅启动（跳过 P1–P7，不重下/不重装）；「未安装」→ 安装段（P0–P7）后启动。另提供显式 `--mode install`（强制进入安装段，**幂等增量**——仅补缺失/过期项，不重下已完成资产）/`--mode launch`（强制仅启动，未完成报 E701）。`run/start.sh` 作为纯启动入口（已装实例可独立调用） |
@@ -195,6 +195,7 @@ veda-setup/                        # 交付仓库根（魔搭实例建议 /mnt/w
 |---|---|---|
 | `--install-root PATH` | 安装根目录 | 自动探测（魔搭实例 → `/mnt/workspace/comfyui-veda`） |
 | `--mode NAME` | 运行模式：`auto`/`install`/`launch` | **`auto`（默认）**：据 `install_completed` 自动判定——已安装仅启动（预检失败自动降级转安装段）、未安装则安装+启动；`install`：强制进入安装段（幂等增量，仅补缺失/过期项）后启动；`launch`：强制仅启动（跳过安装段，安装不完整报 E701） |
+| `--only LIST`（v2.3.7） | 单环节执行：`p1`–`p8` 逗号分隔（如 `--only p5`、`--only p1,p3`；也接受 `5` 裸数字） | 无（默认执行安装段全流程）。给出后强制走安装段路径但**仅执行指定环节**（P0 预检始终前置，提供环境/档位/网络上下文）；`install_completed` **不变更**（部分执行不构成完整安装）；未含 `p8` 则不启动（等同 `--no-launch`）；与 `--mode launch` 同用记 WARN 并以 `--only` 为准 |
 | `--profile NAME` | `minimal`/`standard`/`full`/`lowvram` | **自动**：按 P0 实测显存映射（<16GB→lowvram / 16–24GB→standard / >24GB→full），**设计层不假设任何 GPU**；磁盘不足自动降档并 WARN |
 | `--source-priority LIST` | 下载源优先级（覆盖自动探测） | **auto（按环境自适应：魔搭 `modelscope,github-ghproxy,codeload`；通用 `modelscope,hf-mirror,huggingface`，E5/E6）** |
 | `--skip-models` | 跳过主模型资产（只搭环境） | false |
@@ -276,6 +277,7 @@ veda-setup/                        # 交付仓库根（魔搭实例建议 /mnt/w
   - `--mode install` → 强制走安装段 + 启动段（无视 `is_installed`）；
   - `--mode launch` → 强制仅启动段；若 `is_installed()` 为 False → 立即 `E701` 退出（提示先用 `auto`/`install`）；
   - `--mode auto`（默认）→ `is_installed()` 为真 → 仅启动段（其轻量预检若失败，**自动降级转安装段**而非报错，见「轻量预检」节）；为假 → 安装段 + 启动段；
+- **`--only` 单环节执行（v2.3.7）**：给出 `--only pN[,pN]` 时跳过 M0 分流、强制走安装段路径，但仅执行指定环节（P0 预检始终前置以提供环境/档位/网络上下文）；`install_completed` **不复位也不置位**（部分执行不构成完整安装，避免半成品被 M0 误判）；未含 `p8` 则不启动；与 `--mode launch` 同用记 WARN 并以 `--only` 为准。用途：单环节重试（如 `--only p5` 补模型）、单环节重装（如 `--only p3` 重装节点）；
 - **`--no-launch` 交互**：安装段末尾的 P8 仍受 `--no-launch` 控制（装完不启动）；`launch` 模式若同时带 `--no-launch` 视为无意义，记 WARN 并跳过启动（不报错，等同「仅确认已安装」）；
 - **`install_completed` 复位（v2.3.6 补充）**：进入安装段（`run_install`）时先将 `install_completed` 复位为 `false` 并落盘；安装段全部成功后再置 `true`——防止重装/更新半途失败时旧标志残留，导致下次 auto 误判「已安装」直接启动缺资产的实例；
 - **日志与可观测**：M0 必打印一条 `MODE_DECISION` 事件（`install` / `launch-only`），便于用户确认当前走的是哪条路径。
@@ -284,7 +286,7 @@ veda-setup/                        # 交付仓库根（魔搭实例建议 /mnt/w
 - 平台/架构识别；Python 探测（Windows 依次 `py -3`/`python`，其余 `python3`/`python`；要求 3.10–3.12）；git 存在性（缺失不阻塞，走 tarball 安装路径）；
 - GPU：`nvidia-smi` → 名称/显存/计算能力（< SM80 报 E102 退出；无 GPU 报错并提示 CPU 模式不可用）；**默认 Profile 严格按实测显存映射**（<16GB→lowvram、16–24GB→standard、>24GB→full），**设计层不假设任何 GPU 型号**；A10 仅是魔搭免费实例的实测硬件，standard 是其在 24GB 下的预期档位，最终由运行时确认（F14/G6）；
 - 磁盘：**可用空间 vs（模型体积 + ComfyUI ~3GB + venv ~3GB + 缓存预留 ~1.5×模型，见 §6 规则8/9）**，按真实 `Content-Length` 汇总；低于阈值自动降档并 WARN（E1）；
-- 网络探测：`modelscope.cn`、`hf-mirror.com`、`huggingface.co`、`github.com`、`gh-proxy.com` 等，生成《源可用性表》；**魔搭实例内 huggingface 受限（F17），源链自动排除 hf-mirror/huggingface，改为 `modelscope → github(gh-proxy) → codeload(末位)`；通用环境为 `modelscope → hf-mirror → huggingface`**（E5/E6）；
+- 网络探测：`modelscope.cn`、`hf-mirror.com`、`huggingface.co`、`github.com`、`gh-proxy.com` 等，生成《源可用性表》；**魔搭实例内 huggingface.co 直连受限（F17+2026-10-12 实测），但 hf-mirror 实测可达**——模型源链为 `modelscope → hf-mirror → gh-proxy 代理 HF(末位)`，代码源链为 `github 直连(首位尝试) → gh-proxy → codeload(末位)`；通用环境为 `modelscope → hf-mirror → huggingface`（E5/E6，详见 §9.2）；
 - **魔搭实例识别**：存在 `/mnt/workspace` 且镜像预装 torch → 标记 `env=modelscope`，后续复用系统 torch，并**强制 `--local-code` 关闭**（E3）；
 - 存在**未完成的安装**（`install_completed` 未置位，如曾被中断）→ 读 state 文件（校验 `platform/profile/manifest_sha1`），输出《恢复计划》（将跳过/将执行的清单）；**已安装实例（`install_completed=true`）已在 M0 分流至仅启动路径，不会进入 P0**；
 - **并发锁（含 stale 检测，在驱动入口获取——先于 M0 模式判定，安装/启动两路径共用）**：创建 `.setup.lock`（含 PID）；若已存在且持有者存活 → E603 退出；若持有者已死 → 自动释放后继续（§6 规则6）；输出《环境报告》。
@@ -292,6 +294,7 @@ veda-setup/                        # 交付仓库根（魔搭实例建议 /mnt/w
 ### P1 ComfyUI 本体
 - state 记录版本；**manifest 锁定已知可用 commit（可复现，防上游破坏）**；已安装且 ≥0.38.0 → 跳过；已安装但更低 → `git fetch` + `git checkout <commit>` 升级；未安装/升级 → 按锁定 commit 获取（**SHA 不能 `--depth 1 --branch` 后 checkout——浅克隆不含历史 commit 会失败**），正确做法：`git clone --filter=blob:none --no-checkout <url> <dest>` → `git -C <dest> fetch origin <commit>` → `git -C <dest> checkout <commit>`（blobless，不全量历史）；**GitHub 经 gh-proxy 代理**：临时 `git config url."https://gh-proxy.com/https://github.com/".insteadOf "https://github.com/"`，仅局部/本次会话，用完还原，禁止 Token（E6）；git 失败降级 tarball：`https://<proxy>/https://github.com/<repo>/archive/<commit>.tar.gz`（**注意用 commit SHA 而非分支名，保证可复现**，多代理候选依次尝试）；两者都失败才 E201；
 - 非 git 的外来安装 → E601。
+- **阶段级快速跳过（v2.3.7，重试提速）**：`ComfyUI/.git` 存在且 `git rev-parse HEAD` == manifest 锁定 commit → P1 整体直接跳过（不 fetch、不探测代理——魔搭内 git 直连必失败，重复 fetch 是纯浪费）；仅 HEAD 不匹配或目录缺失时才进入获取/升级链。`_git_clone` 对已存在仓库同样先比对 HEAD，匹配即返回。
 
 ### P2 运行依赖
 - venv：魔搭/系统有 torch 时用 `--system-site-packages` 复用（**省去数 GB torch 下载**），否则按 CUDA 版本装官方 wheel；torch 升级只进 venv，不动系统包；
@@ -304,13 +307,15 @@ veda-setup/                        # 交付仓库根（魔搭实例建议 /mnt/w
 - ComfyUI-Manager 为 **best-effort**：失败仅 WARN，不影响主流程。
 
 ### P3 Veda 节点 + MiniMax-H3 加载器（E2，关键）
-- **Veda 加速节点**：clone/升级 `custom_nodes/Veda-on-ComfyUI`（git → tarball 降级链同 P1，commit 处理同 §8 P1），**按 manifest 锁定 commit checkout**（§9.1 可复现性）；装节点自带 requirements（若有）；Manager/Registry 方式作为最终兜底；全部失败才 E301；
+- **Veda 加速节点**：clone/升级 `custom_nodes/Veda-on-ComfyUI`（git → tarball 降级链同 P1，commit 处理同 §8 P1），**按 manifest 锁定 commit checkout**（§9.1 可复现性）；装节点自带 requirements（若有）；Manager/Registry 方式作为最终兜底；全部失败才 E301。**重试快速跳过（v2.3.7）**：节点 `.git` 存在且 HEAD == 锁定 commit → 跳过 clone；节点依赖（requirements/FA4）以节点目录内标记文件（`.veda-req-done`，内容=锁定 commit）判重——标记匹配即跳过 pip 安装，commit 变更后自动重装；
 - **FA4 运行时（best-effort，可选增强）**：若节点含 `install_fa4.py`（FA4 后端，CUDA13 CuTe DSL / macOS MLX），best-effort 运行其自测；默认 Triton INT8 后端由节点自带内核 + Triton 提供（SM80+ 即可），FA4 仅为可选加速，失败不阻断主流程；
 - **MiniMax-H3 模型加载器（仅装 Veda 无法出片，必须处理）**：**已实测确认走 ComfyUI 原生加载器（G3）**——ComfyUI 自 v0.38.0 起原生支持 MiniMax-H3（官方 PR `Comfy-Org/ComfyUI#15224`，2026-08-03 合并，新增 4 个原生节点 + 6 个官方工作流模板），故**不 clone 任何第三方加载器节点**（原 `Comfy-Org/ComfyUI-MiniMaxH3` 经 G2 核实不存在 404）。本阶段**显式校验原生加载器节点存在**（`object_info` 中节点 id 含 `minimax`/`h3`，不区分大小写）；加载器与 Veda 串联（MODEL: 加载器 out → Veda in → Veda out → sampler）由 P6 模板保证。
 
 ### P4 预测器权重（×2 ≈ 525MB：T2VA/R2VA 各 ≈262MB，魔搭实测）
 - 从 manifest 取 T2VA/FL2VA（+R2VA，随 Profile）；
-- 源链：遵循 §9.2 auto 自适应链（魔搭内 `modelscope → gh-proxy 代理的 HF（best-effort）`；通用 `modelscope → hf-mirror → HF`），文件以魔搭页当前为准（G1）；
+- 源链：遵循 §9.2 auto 自适应链（魔搭内 `modelscope → hf-mirror（实测可达，优先兜底）→ gh-proxy 代理的 HF（末位 best-effort）`；通用 `modelscope → hf-mirror → HF`），文件以魔搭页当前为准（G1；两个预测器仓库与文件名已于 2026-10-12 经魔搭 API 实测确认存在，t2va=275,415,648B、r2va=275,415,752B）；
+- **下载落点规则（v2.3.7 修正，实测发现的 E401 根因）**：CLI `--local_dir` 会按仓库内路径展开——`include` 型源（仓库内带子目录，如 Comfy-Org 的 `diffusion_models/xxx`）用 `--local_dir <root>/ComfyUI/models`；`file` 型源（仓库根裸文件名，如 Veda 预测器）**必须**用 `--local_dir <target 的父目录>`（`models/veda/`），否则文件落在 `models/` 根而校验目标在子目录，下载成功也判失败；
+- **错位文件回收（v2.3.7）**：检测到旧版本脚本下载的错位文件（`models/<裸文件名>` 存在而 target 缺失且体积≥min_bytes、头部可解析）→ 直接迁移到正确位置并校验，不重新下载；
 - 校验：≥250MB + safetensors 头部 JSON 可解析（防 HTML 错误页/截断）；
 - 完成写 state（含 sha256 前 64KB 快速指纹，供跨实例比对）。
 
@@ -318,7 +323,7 @@ veda-setup/                        # 交付仓库根（魔搭实例建议 /mnt/w
 - **License 合规**：`--accept-license` 默认 true，本阶段开始前记录 `ACCEPT_LICENSE` 事件（含 License URL 与地域限制 F18，详见 §10），`--interactive` 下改为人工确认；
 - manifest 按 Profile 生成清单 → 汇总真实体积（`Content-Length`）→ 日志记录 → 开始；
 - 主源：`modelscope download --model Comfy-Org/MiniMax-H3 --include "<子目录>/<文件>" --local_dir <root>/ComfyUI/models`（目录结构以魔搭页为准，F9/G1；`--include` 子目录 glob 语义在 M3 用小文件实测确认）；
-- 单文件失败按 §9.2 auto 链降级（魔搭内不降级到受限的 hf-mirror/HF，改走 gh-proxy 代理的 HF best-effort；通用环境走 hf-mirror → HF）；3 次重试 + 指数退避；
+- 单文件失败按 §9.2 auto 链降级（魔搭内次选 **hf-mirror（实测可达，优先兜底）**，gh-proxy 代理 HF 仅末位 best-effort；通用环境走 hf-mirror → HF）；3 次重试 + 指数退避；下载落点与错位回收规则同 §8 P4（v2.3.7）；
 - **免费额度可能中途耗尽**：所有下载可随时中断，重跑时基于 per-asset state 续传（modelscope/hf CLI 均支持断点），已完成文件不重下；
 - 全部落位后输出《资产核对表》（文件/目标目录/大小/校验结果）。
 
@@ -399,10 +404,14 @@ launch 路径（auto 判定为已安装，或显式 `--mode launch`）**不跑 P
 
 ```
 候选链 = --source-priority（默认 auto）过滤 + P0 可达性探测结果（E5/E6）
-  魔搭实例:  modelscope → github(gh-proxy.com) → github(ghproxy.net) → github(gitclone.com) → codeload(末位, 同样走代理)
-  通用环境:  modelscope → hf-mirror → huggingface
+  魔搭实例·代码源:  github(gh-proxy.com) → github(ghproxy.net) → github(gitclone.com) → codeload(末位, 同样走代理)
+                   （github 直连不稳定——2026-10-12 实测时而通时而不通，直连仅作首位尝试）
+  魔搭实例·模型源:  modelscope → hf-mirror（实测可达，优先兜底）→ gh-proxy 代理 HF（末位 best-effort）
+                   （huggingface.co 直连实测不可达；hf-mirror 实测可达——v2.3.7 依实测修正，旧版"排除 hf-mirror"作废）
+  通用环境·模型源:  modelscope → hf-mirror → huggingface
 state 以资产为最小粒度记录（见 §6 规则5），中断恢复精确到单个文件
 对每个资产：按候选链逐源尝试 → 成功即校验 → 通过则落盘写 state；全部失败 → E401 + 诊断包
+下载落点：include 型源 --local_dir=<root>/ComfyUI/models；file 型源 --local_dir=<target 父目录>（§8 P4）
 ```
 
 - ModelScope 源：`modelscope download --model <repo> [--include <glob>] [<file>] --local_dir <局部目录>`；缓存默认重定向到 `<root>/.cache/modelscope`，**当持久盘容量紧张时改指本地盘 `/root/.cache/modelscope`（§6 规则8b）以规避峰值爆盘**；下载校验通过后默认清理该缓存（`--keep-cache` 可关）；
@@ -438,7 +447,7 @@ state 以资产为最小粒度记录（见 §6 规则5），中断恢复精确�
 | **只装 Veda 缺 MiniMax-H3 加载器，工作流缺节点（E2）** | P3 显式校验 ComfyUI 原生加载器（已移除第三方节点兜底 `ComfyUI-MiniMaxH3`——G2 核实该仓库不存在 404）；P7 增加"加载器节点可见"验收 |
 | **`--local-code` 与"免重装"在魔搭自相矛盾（E3）** | 魔搭环境（检测到 `/mnt/workspace`）强制 `--local-code` OFF，全部内容落持久盘；仅 T2/T3 可选 |
 | **P8 前台启动卡死安装命令（E4）** | P8 改为 `nohup ... &` 后台启动 + 就绪探测，安装命令立即返回；提供 run/start·stop·status |
-| **魔搭 Notebook 外网受限含 huggingface（F17/E5）** | 魔搭环境源链自动排除 hf-mirror/huggingface，改为 `modelscope → github(gh-proxy) → codeload` |
+| **魔搭 Notebook 外网受限含 huggingface（F17/E5，2026-10-12 实测）** | huggingface.co 直连不可达、hf-mirror 可达：模型源链 `modelscope → hf-mirror → gh-proxy 代理 HF(末位)`；代码源链 `github 直连(首位尝试) → gh-proxy → codeload` |
 | **GitHub 兜底用 codeload 同样被墙（E6）** | GitHub 类源统一走可达代理（gh-proxy.com 等，多候选+探测），禁止带 Token；用完还原 git insteadOf |
 | **MiniMax H3 许可地域排除（F18）** | P5 自动接受 License 时日志/README 提示：不适用于美/欧/英/韩用户；商业使用受限；中国个人非商业无碍 |
 | **并发锁崩溃后永久死锁** | `.setup.lock` 含 PID/stale 检测，持有者已死自动释放（§6 规则6） |
@@ -599,3 +608,4 @@ bash veda-setup/install.sh
 | v2.3.4 | **代码实现对齐 v2.3.3（无新增假设）**：① `lib/assets.py` 移除失效代理 `mirror.ghproxy.com`，候选链改为 gh-proxy.com/ghproxy.net/gitclone.com（§9.2）；② 修复 `_git_clone` 的 SHA 克隆 bug：`blobless clone --no-checkout` → `git fetch origin <sha>` → `git checkout <sha>`，分支/标签仍走轻量 `--depth 1 --branch`（§8 P1）；③ 修复 `_tarball`：SHA 用 `archive/<sha>.tar.gz`、分支用 `archive/refs/heads/<ref>.tar.gz`，`download_repo` 透传 SHA（不再误回退 `main`）；④ `lib/phases.py`：P3 补节点自带 `requirements.txt` + `install_fa4.py` best-effort（均非致命）；P6 显式拷贝 Veda 节点 `example_workflows/*.json` 到 `user/default/workflows/`；P7 清理已失效的 `ComfyUI-MiniMaxH3` 死引用，仅报告原生加载器依赖。Python 3.10 下 py_compile 全通过，20 项逻辑自测（SHA 检测/代理链/克隆序列/解包 URL/phases 导入）全绿 |
 | v2.3.5 | **安装/启动分离与已安装自动判定（设计层，代码待 M6 实现）**：① 新增 M0 运行模式判定（§8）：`--mode {auto,install,launch}`，默认 `auto`——据 `is_installed()` 自动分流，已安装实例仅启动（跳过 P1–P7 安装段），新实例自动安装+启动；② `is_installed()` 四项判定（纯文件系统 + state，无网络/外部假设）：`install_completed=true` ∧ `manifest_sha1` 一致 ∧ `ComfyUI/.git` 存在 ∧ `Veda-on-ComfyUI/.git` 存在；③ state 顶层新增 `install_completed`/`install_profile`，安装段（P0–P7）全部成功后写入（§6 规则3）；④ 新增 launch 专用轻量预检（只读：env + venv 路径校验 + `main.py` 存在性，不跑磁盘/网络/降档、不创建 venv）；**预检失败分流：auto 自动降级转安装段（幂等增量，仅重建失效 venv，不重下模型），仅显式 `--mode launch` 报 E701**——覆盖"新实例镜像 Python 变化致 venv 失效"场景（F11/§10），不让用户被 E701 卡死；⑤ 新增 E701 错误码（仅限显式 launch）与 `MODE_DECISION` 日志事件（含 `fallback_reason`）；⑥ 同步更新 §1.2 目标、§4 映射表、§5 架构图、§7.2 参数表、§7.3 默认行为表、§8 流程图与 P0 措辞（锁在驱动入口先于 M0 获取）、§11.2、§13 DoD（新增安装/启动分离验收项，含 venv 失效降级用例）、§14.1/14.3 使用说明、§15 新增 M6 里程碑。**自检修正**：`--mode install` 统一表述为「强制进入安装段（幂等增量）」而非「强制重装」（避免误导全量重下）；轻量预检由 `ensure_venv`（缺失时会创建，有写副作用）改为 `venv_python()` 仅解析路径+校验 |
 | v2.3.6 | **M6 代码实现落地（按 v2.3.5 设计，无新增外部假设）**：① `lib/diag.py`：注册 E701；`State` 默认数据含 `install_completed=false`/`install_profile=null`（损坏重置分支同步）；② `lib/phases.py`：新增 `is_installed()`（四项判定）、`decide_mode()`（M0 模式映射 + `MODE_DECISION` 事件 + 显式 launch 未安装即 E701）、`preflight_launch()`（只读轻量预检：env + `venv_python()` 路径校验 + `main.py` 存在性，失败抛 701，auto 由上层降级）；`run_phases` 重构为 `run_install`（P1–P7 + **进入时复位 `install_completed=false`** + 成功后置 `true` 并记 `install_profile`），P8 启动段独立由驱动调用；③ `setup_veda.py`：新增 `--mode {auto,install,launch}`；主流程重构为「锁 → M0 判定 → launch 路径（轻量预检→P8，auto 预检失败自动降级转安装段并记 `fallback_reason`）／install 路径（P0→run_install→P8）」；dry-run 输出模式判定；清理 `version_snapshot` 中已废弃的 `ComfyUI-MiniMaxH3` 死引用；④ 使用说明/问题排错/README 同步 `--mode`、E701 与自动分流说明。本地校验：py_compile 全通过；自测覆盖 is_installed 四分支/decide_mode 全映射/701 抛出/复位落盘/argparse 语义 |
+| v2.3.7 | **首次魔搭真实实例实测反馈修复（E401 复盘，代码随本版实现）**：实测环境：魔搭 A10 24GB / `/mnt/workspace` / P0–P4 一次通过（档位 standard、缓存重定向、stale 锁自动释放均符合设计）。**根因修正**：① P5 `veda-predictor-t2va` E401——`download_model_asset` 把 `file` 型源（Veda 预测器，仓库根裸文件名）统一下载到 `--local_dir models/` 根，而 target 在 `models/veda/` 子目录，**下载成功但落错位置致校验失败**（魔搭 API 实测两预测器仓库/文件均存在：t2va=275,415,648B、r2va=275,415,752B，min_bytes 下界有效，排除大小问题）；修正为按源类型分派 local_dir（§8 P4 落点规则）+ 错位文件迁移回收（不重下）；② hf 兜底端点错误——魔搭内被改写为 gh-proxy 代理 HF（不代理 HF，必失败）而 hf-mirror 实测可达；修正源链为 `modelscope → hf-mirror → gh-proxy HF(末位)`（§9.2/P0/P4/P5 同步）；③ 重试无阶段级跳过——P1 旧跳过条件 `not meta_changed("","","")` 恒 False（state 真实元数据 vs 空串永不等），每次重试重复 fetch（魔搭 git 直连必败，纯浪费）；P3 依赖每次重装；修正为 commit 匹配快速跳过（P1/P3/`_git_clone` 三层）+ `.veda-req-done` 标记判重；④ 新增 `--only pN[,pN]` 单环节执行（§7.2/M0：P0 前置、install_completed 不变更、未含 p8 不启动）。 |

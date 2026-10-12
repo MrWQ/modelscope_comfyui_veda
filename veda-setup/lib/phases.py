@@ -223,6 +223,9 @@ def phase0_preflight(ctx: Ctx):
     if not any(ctx.network_table.get(k) for k in ("modelscope", "hf-mirror", "huggingface", "gh-proxy")):
         raise PhaseError(106, "所有下载源网络不可达")
 
+    # venv 路径解析（只读，不创建；供 --only p7/p8 单环节执行时 P2 未跑的场景使用）
+    ctx.venv_python = platform.venv_python(ctx.root)
+
     # 外部 ComfyUI 检测（E601）
     if os.path.isdir(ctx.comfyui_dir) and not os.path.isdir(os.path.join(ctx.comfyui_dir, ".git")) \
             and not ctx.args.force:
@@ -269,12 +272,16 @@ def phase0_preflight(ctx: Ctx):
 # ---------------------------------------------------------------------------
 def phase1_comfyui(ctx: Ctx):
     log = ctx.logger
-    if os.path.isdir(ctx.comfyui_dir) and os.path.isdir(os.path.join(ctx.comfyui_dir, ".git")) \
-            and not ctx.state.meta_changed("", "", ""):
-        log.ok("P1", "skip", "ComfyUI 已就绪")
-        return
-    log.info("P1", "start", "安装 ComfyUI")
     repo = next(r for r in ctx.manifest["repos"] if r["id"] == "comfyui")
+    commit = repo.get("commit")
+    # 快速跳过（v2.3.7）：已存在且 HEAD == 锁定 commit → 整体跳过（不 fetch/不探测代理）。
+    # 旧条件 not meta_changed("","","") 恒 False（state 真实元数据 vs 空串永不等），已废弃。
+    if (os.path.isdir(os.path.join(ctx.comfyui_dir, ".git"))
+            and commit and not commit.startswith("PINNED")
+            and assets._git_head(ctx.comfyui_dir) == commit):
+        log.ok("P1", "skip", "ComfyUI 已对齐锁定 commit，跳过获取", detail=commit[:12])
+        return
+    log.info("P1", "start", "安装/对齐 ComfyUI")
     if not assets.download_repo(repo, ctx.comfyui_dir, assets.GH_PROXY_CANDIDATES, log):
         raise PhaseError(201, "ComfyUI clone 与 tarball 均失败")
     ver = _comfyui_version(ctx.comfyui_dir)
@@ -317,40 +324,67 @@ def phase2_deps(ctx: Ctx):
 def phase3_nodes(ctx: Ctx):
     log = ctx.logger
     veda_dir = os.path.join(ctx.comfyui_dir, "custom_nodes", "Veda-on-ComfyUI")
-    if not (os.path.isdir(veda_dir) and os.path.isdir(os.path.join(veda_dir, ".git"))):
-        repo = next(r for r in ctx.manifest["repos"] if r["id"] == "veda")
-        log.info("P3", "veda", "安装 Veda 节点")
+    repo = next(r for r in ctx.manifest["repos"] if r["id"] == "veda")
+    commit = repo.get("commit")
+    # 快速跳过（v2.3.7）：HEAD == 锁定 commit → 跳过 clone；不匹配则走获取/升级链
+    if (os.path.isdir(os.path.join(veda_dir, ".git"))
+            and commit and not commit.startswith("PINNED")
+            and assets._git_head(veda_dir) == commit):
+        log.ok("P3", "veda", "Veda 节点已对齐锁定 commit，跳过获取", detail=commit[:12])
+    else:
+        log.info("P3", "veda", "安装/对齐 Veda 节点")
         if not assets.download_repo(repo, veda_dir, assets.GH_PROXY_CANDIDATES, log):
             raise PhaseError(301, "Veda 节点安装失败")
-    else:
-        log.ok("P3", "veda", "Veda 节点已存在，跳过")
     # MiniMax-H3 加载器：走 ComfyUI 原生支持（Comfy-Org/MiniMax-H3 官方带 comfyui 标签）。
     # 设计原"方案 B 兜底 clone ComfyUI-MiniMaxH3"经核实该仓库不存在（404），已移除对应 manifest 条目，
     # 此处不再尝试 clone，仅记录依赖原生加载器，由 P7 验收确认。
     log.info("P3", "loader", "依赖 ComfyUI 原生 MiniMax-H3 加载器（Comfy-Org/MiniMax-H3 官方 comfyui 模型）；已于 P7 验收确认")
 
-    # 节点自带依赖（best-effort，非致命，§8 P3）：若节点根目录有 requirements.txt 则尝试安装
-    req = os.path.join(veda_dir, "requirements.txt")
-    if os.path.exists(req):
-        env = os.environ.copy()
-        env["PIP_CACHE_DIR"] = ctx.pip_cache
-        try:
-            subprocess.run([ctx.venv_python, "-m", "pip", "install", "-r", req],
-                           env=env, check=True, capture_output=True, text=True, timeout=1200)
-            log.ok("P3", "req", "Veda 节点依赖安装完成")
-        except subprocess.CalledProcessError as e:
-            log.warn("P3", "req", "Veda 节点依赖安装失败（best-effort，忽略）", detail=e.stderr[-300:])
+    # 节点自带依赖 + FA4（best-effort，非致命，§8 P3）——以标记文件判重（v2.3.7）：
+    # 标记内容=锁定 commit，commit 变更后自动重装；重试时标记匹配即跳过 pip。
+    marker = os.path.join(veda_dir, ".veda-req-done")
+    marker_ok = False
+    try:
+        with open(marker, "r", encoding="utf-8") as f:
+            marker_ok = f.read().strip() == (commit or "")
+    except Exception:  # noqa: BLE001
+        marker_ok = False
+    if marker_ok:
+        log.ok("P3", "req", "节点依赖已安装（标记匹配锁定 commit），跳过")
+    else:
+        req = os.path.join(veda_dir, "requirements.txt")
+        req_ok = True
+        if os.path.exists(req):
+            env = os.environ.copy()
+            env["PIP_CACHE_DIR"] = ctx.pip_cache
+            try:
+                subprocess.run([ctx.venv_python, "-m", "pip", "install", "-r", req],
+                               env=env, check=True, capture_output=True, text=True, timeout=1200)
+                log.ok("P3", "req", "Veda 节点依赖安装完成")
+            except subprocess.CalledProcessError as e:
+                req_ok = False
+                log.warn("P3", "req", "Veda 节点依赖安装失败（best-effort，忽略；下次重试将重新安装）",
+                         detail=e.stderr[-300:])
 
-    # FA4 运行时（best-effort 可选增强，§8 P3）：若节点含 install_fa4.py 则尝试其自测，
-    # 失败不阻断主流程（默认 Triton INT8 后端由节点自带内核 + Triton 提供，SM80+ 即可）。
-    fa4 = os.path.join(veda_dir, "install_fa4.py")
-    if os.path.exists(fa4):
-        try:
-            log.info("P3", "fa4", "检测到 install_fa4.py，best-effort 运行自测（可选加速，失败不阻断）")
-            subprocess.run([ctx.venv_python, fa4], check=False,
-                           capture_output=True, text=True, timeout=300)
-        except Exception as e:  # noqa: BLE001
-            log.warn("P3", "fa4", "FA4 自测未通过（可选，忽略）", detail=str(e)[:160])
+        # FA4 运行时（best-effort 可选增强，§8 P3）：若节点含 install_fa4.py 则尝试其自测，
+        # 失败不阻断主流程（默认 Triton INT8 后端由节点自带内核 + Triton 提供，SM80+ 即可）。
+        fa4 = os.path.join(veda_dir, "install_fa4.py")
+        if os.path.exists(fa4):
+            try:
+                log.info("P3", "fa4", "检测到 install_fa4.py，best-effort 运行自测（可选加速，失败不阻断）")
+                subprocess.run([ctx.venv_python, fa4], check=False,
+                               capture_output=True, text=True, timeout=300)
+            except Exception as e:  # noqa: BLE001
+                log.warn("P3", "fa4", "FA4 自测未通过（可选，忽略）", detail=str(e)[:160])
+
+        # 依赖装好（或本就无 requirements.txt）才写标记，避免重试重复 pip；
+        # pip 失败不写标记，下次重试会重新安装（缺失会在 P7 报告）
+        if req_ok:
+            try:
+                with open(marker, "w", encoding="utf-8") as f:
+                    f.write(commit or "")
+            except Exception:  # noqa: BLE001
+                pass
     log.ok("P3", "done", "节点阶段完成")
 
 
@@ -612,30 +646,48 @@ def phase8_launch(ctx: Ctx):
 # ---------------------------------------------------------------------------
 # 主编排（v2.3.6：安装段与启动段分离，§8）
 # ---------------------------------------------------------------------------
-def run_install(ctx: Ctx):
+def run_install(ctx: Ctx, only: set | None = None):
     """安装段 P1–P7（P0 由驱动先行调用）+ 写 install_completed（§6 规则3）。
 
     进入时先复位 install_completed=false 并落盘（防重装半途失败后旧标志
     残留导致 M0 误判「已安装」）；P1–P7 全部成功后置 true 并记 install_profile。
+
+    --only（v2.3.7）：仅执行指定环节（如 {'p5'}），install_completed 不复位也
+    不置位（部分执行不构成完整安装）；P4/P5 仍受 --skip-models 约束。
     """
     log = ctx.logger
-    ctx.state.data["install_completed"] = False
-    ctx.state.data["install_profile"] = None
-    ctx.state.save()
-    phase1_comfyui(ctx)
-    phase2_deps(ctx)
-    phase3_nodes(ctx)
-    if not ctx.args.skip_models:
-        phase4_predictors(ctx)
-        phase5_models(ctx)
-    phase6_templates(ctx)
-    phase7_verify(ctx)
-    # 安装段全部成功 → 标记「已安装」（§6 规则3 / §8 M0）
-    ctx.state.data["install_completed"] = True
-    ctx.state.data["install_profile"] = ctx.profile_name
-    ctx.state.save()
-    log.ok("INSTALL", "done", "安装段完成（install_completed=true）",
-           detail={"profile": ctx.profile_name, "root": ctx.root})
+    only = only or set()
+    full = not only
+    if full:
+        ctx.state.data["install_completed"] = False
+        ctx.state.data["install_profile"] = None
+        ctx.state.save()
+    steps = [
+        (1, "P1", lambda: phase1_comfyui(ctx)),
+        (2, "P2", lambda: phase2_deps(ctx)),
+        (3, "P3", lambda: phase3_nodes(ctx)),
+        (4, "P4", lambda: phase4_predictors(ctx) if not ctx.args.skip_models else None),
+        (5, "P5", lambda: phase5_models(ctx) if not ctx.args.skip_models else None),
+        (6, "P6", lambda: phase6_templates(ctx)),
+        (7, "P7", lambda: phase7_verify(ctx)),
+    ]
+    for n, label, fn in steps:
+        if only and n not in only:
+            log.info(label, "skip", f"按 --only 跳过 {label}")
+            continue
+        fn()
+    if full:
+        # 安装段全部成功 → 标记「已安装」（§6 规则3 / §8 M0）
+        ctx.state.data["install_completed"] = True
+        ctx.state.data["install_profile"] = ctx.profile_name
+        ctx.state.save()
+        log.ok("INSTALL", "done", "安装段完成（install_completed=true）",
+               detail={"profile": ctx.profile_name, "root": ctx.root})
+    else:
+        ctx.state.save()
+        log.ok("INSTALL", "partial",
+               f"部分安装完成（--only {','.join('p%d' % n for n in sorted(only))}；install_completed 未变更）",
+               detail={"profile": ctx.profile_name, "root": ctx.root})
 
 
 def final_summary(ctx: Ctx, mode_label: str):

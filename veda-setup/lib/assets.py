@@ -74,13 +74,25 @@ def fingerprint(path: str) -> str:
 # ---------------------------------------------------------------------------
 def resolve_model_chain(asset: dict, network_table: dict, is_modelscope: bool,
                         gh_proxy_ok: bool) -> list:
-    """返回按优先级排序的源 dict 列表（已针对环境过滤）。"""
+    """返回按优先级排序的源 dict 列表（已针对环境过滤）。
+
+    v2.3.7 修正（实测复盘）：魔搭内 hf 兜底优先 hf-mirror（2026-10-12 魔搭 A10 实例
+    实测可达），gh-proxy 代理 HF 不代理 huggingface（实测必失败），仅作末位 best-effort。
+    """
     sources = asset.get("sources", [])
     chain = []
     if is_modelscope:
         chain += [s for s in sources if s.get("type") == "modelscope"]
-        # best-effort：gh-proxy 可达时，尝试经 gh-proxy 代理 huggingface（G2/G5 未定，仅尝试）
-        if gh_proxy_ok:
+        # 次选：hf-mirror（实测可达，优先兜底）
+        hf_mirror_ok = bool(network_table.get("hf-mirror"))
+        if hf_mirror_ok:
+            for s in sources:
+                if s.get("type") == "hf":
+                    s2 = dict(s)
+                    s2["endpoint"] = "https://hf-mirror.com"
+                    chain.append(s2)
+        # 末位 best-effort：gh-proxy 代理 HF（未证实可用，仅在 hf-mirror 不可达时尝试）
+        if gh_proxy_ok and not hf_mirror_ok:
             for s in sources:
                 if s.get("type") == "hf":
                     s2 = dict(s)
@@ -151,24 +163,55 @@ def download_model_asset(asset: dict, root: str, chain: list, env: dict,
     if fp and state.is_asset_done(asset["id"], fp):
         logger.ok("P5", "asset", f"跳过已完成 {asset['id']}")
         return True, None
-    local_dir = os.path.join(root, "ComfyUI", "models")
-    include = asset.get("include") or asset.get("file") or os.path.basename(target_rel)
+
+    # ---- 错位文件回收（v2.3.7，实测复盘 E401 根因的善后）----
+    # 旧版本把 file 型源下载到 models/ 根，而 target 在子目录 → 下载成功却校验失败。
+    # 检测到错位文件（体积/头部均合格）时直接迁移到正确位置，避免重新下载。
+    rel_parts = target_rel.split("/")          # 例: ComfyUI/models/veda/xxx.safetensors
+    models_root = os.path.join(root, "ComfyUI", "models")
+    if len(rel_parts) > 3:                      # target 在 models/ 的子目录下
+        stray = os.path.join(models_root, rel_parts[-1])
+        if (not os.path.exists(target) and os.path.exists(stray)
+                and verify_file(stray, asset.get("min_bytes", 0), check_header=True)):
+            os.makedirs(os.path.dirname(target), exist_ok=True)
+            shutil.move(stray, target)
+            logger.info("P5", "asset", f"回收错位文件 {asset['id']}（迁移至正确位置，未重新下载）",
+                        detail={"from": stray, "to": target})
+            state.record_asset(asset["id"], "ok", os.path.getsize(target),
+                               fingerprint(target), "relocated")
+            return True, "relocated"
+
+    min_bytes = asset.get("min_bytes", 0)
     last_err = None
     for src in chain:
         try:
+            # ---- 下载落点分派（v2.3.7 修正，E401 根因）----
+            # CLI --local_dir 会按仓库内路径展开：
+            #   include 型源（仓库内带子目录，如 Comfy-Org 的 diffusion_models/xxx）
+            #     → --local_dir <root>/ComfyUI/models，子目录结构原样保留；
+            #   file 型源（仓库根裸文件名，如 Veda 预测器）
+            #     → --local_dir <target 的父目录>（如 models/veda/），否则落错位置。
+            if src.get("include"):
+                local_dir, include = models_root, src["include"]
+            else:
+                fname = src.get("file") or os.path.basename(target_rel)
+                local_dir, include = os.path.dirname(target), fname
             if src.get("type") == "modelscope":
-                _dl_modelscope(src["repo"], include, local_dir, env.get("modelscope_cache"), logger)
+                _dl_modelscope(src["repo"], include, local_dir,
+                               env.get("modelscope_cache"), logger)
             elif src.get("type") == "hf":
                 _dl_hf(src["repo"], include, local_dir, src.get("endpoint"),
                        env.get("hf_cache"), logger)
             else:
                 continue
-            if verify_file(target, asset.get("min_bytes", 0), check_header=True):
+            if verify_file(target, min_bytes, check_header=True):
                 state.record_asset(asset["id"], "ok", os.path.getsize(target),
                                    fingerprint(target), src.get("type"))
                 logger.ok("P5", "asset", f"下载成功 {asset['id']}", detail=src.get("type"))
                 return True, src.get("type")
-            logger.warn("P5", "asset", f"校验失败 {asset['id']}", detail=src.get("type"))
+            logger.warn("P5", "asset", f"校验失败 {asset['id']}",
+                        detail={"source": src.get("type"), "target": target,
+                                "size": os.path.getsize(target) if os.path.exists(target) else -1})
         except Exception as e:  # noqa: BLE001
             last_err = f"{src.get('type')}: {e}"
             logger.warn("P5", "asset", f"源失败 {asset['id']}", detail=str(e)[:160])
@@ -195,6 +238,18 @@ def _looks_like_sha(commit: str) -> bool:
     return len(commit) == 40 and all(c in "0123456789abcdef" for c in commit.lower())
 
 
+def _git_head(dest: str) -> str | None:
+    """读取仓库当前 HEAD（40 位 SHA），失败/非 git 目录返回 None。只读，无副作用。"""
+    try:
+        r = subprocess.run(["git", "-C", dest, "rev-parse", "HEAD"],
+                           capture_output=True, text=True, timeout=30)
+        if r.returncode == 0:
+            return r.stdout.strip()
+    except Exception:  # noqa: BLE001
+        pass
+    return None
+
+
 def _git_clone(url: str, commit: str | None, dest: str, prox: str | None,
                logger=None, timeout: int = 600):
     """克隆/检出仓库到 dest，并精准对齐到 commit（分支名或 40 位 SHA）。
@@ -204,14 +259,17 @@ def _git_clone(url: str, commit: str | None, dest: str, prox: str | None,
     blobless clone（不检出）→ fetch origin <sha> → checkout <sha>。
     分支/标签走浅克隆（--depth 1 --branch）更轻量。
     prox 通过 `-c url.<prox>.insteadOf` 临时重写，不污染全局/仓库配置。
+    快速跳过（v2.3.7）：已存在且 HEAD == commit → 直接返回（不 fetch——
+    魔搭内 git 直连必失败，重复 fetch 是纯浪费）。
     """
     prefix = ["git"]
     if prox:
         prefix += ["-c", f'url."{prox}".insteadOf="https://github.com/"']
 
     if os.path.isdir(os.path.join(dest, ".git")):
-        # 已存在：直接 fetch + checkout（兼容分支名或 SHA）
         if commit and not commit.startswith("PINNED"):
+            if _git_head(dest) == commit:
+                return  # 已对齐锁定 commit，无需任何网络操作
             subprocess.run(prefix + ["-C", dest, "fetch", "origin", commit],
                            check=True, capture_output=True, text=True, timeout=timeout)
             subprocess.run(["git", "-C", dest, "checkout", commit],
@@ -277,6 +335,12 @@ def download_repo(repo_spec: dict, dest: str, proxy_candidates: list,
         logger.warn("P1", "repo", f"commit 为占位哨兵，回退默认分支（不可复现）",
                     detail=repo_spec["id"])
         commit = None
+    # 0) 快速跳过（v2.3.7）：已存在且 HEAD == 锁定 commit → 直接成功，零网络操作
+    if commit and os.path.isdir(os.path.join(dest, ".git")) and _git_head(dest) == commit:
+        if logger:
+            logger.ok("P1", "repo", f"{repo_spec['id']} 已对齐锁定 commit，跳过获取",
+                      detail=commit[:12])
+        return True
     # 1) git 直连
     try:
         _git_clone(url, commit, dest, None, logger, timeout)
