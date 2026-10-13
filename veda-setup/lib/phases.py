@@ -49,6 +49,7 @@ class Ctx:
         self.pip_cache = None
         self.plan = []
         self.user_aborted = False  # v2.3.9：无 GPU 经询问后用户选择不继续
+        self.launch_ready = None  # v2.3.11：P8 就绪标记，供 final_summary 诚实汇报
 
 
 # ---------------------------------------------------------------------------
@@ -156,6 +157,23 @@ def preflight_launch(ctx: Ctx):
     main_py = os.path.join(ctx.comfyui_dir, "main.py")
     if not os.path.isfile(main_py):
         raise PhaseError(701, f"ComfyUI 主程序缺失（{main_py}）——安装不完整")
+    # v2.3.11：launch 路径不跑 P7，补一道 CUDA 可用性早期信号（Veda 需 GPU 才能运行；
+    # 无 GPU 时 ComfyUI 启动即崩溃、端口永不开放，提前预警便于排查，不直接阻断）
+    try:
+        r = subprocess.run([vpy, "-c",
+                            "import torch; print('cuda' if torch.cuda.is_available() else 'nocuda')"],
+                           capture_output=True, text=True, timeout=60)
+        if r.returncode == 0 and "nocuda" in r.stdout:
+            log.warn("LP", "gpu", "torch.cuda 不可用（当前环境无 NVIDIA GPU），"
+                     "ComfyUI 启动后可能立即崩溃（Veda 需 GPU 才能运行）",
+                     detail={"stderr": r.stderr[-200:]})
+        elif r.returncode != 0:
+            log.warn("LP", "gpu", "torch 导入失败，无法确认 CUDA 可用性",
+                     detail={"stderr": r.stderr[-200:]})
+        else:
+            log.info("LP", "gpu", "torch.cuda 可用", detail=r.stdout.strip())
+    except Exception as e:  # noqa: BLE001
+        log.warn("LP", "gpu", "CUDA 探测异常，跳过", detail=str(e)[:200])
     log.ok("LP", "done", "轻量预检通过（venv 可用、ComfyUI 就位）", detail=vpy)
 
 
@@ -584,6 +602,16 @@ def _port_ready(port: int, timeout: float = 3.0) -> bool:
         return False
 
 
+def _tail_log(path: str, n: int = 50) -> str:
+    """读取日志末尾 n 行，供启动失败时就地展示崩溃原因（v2.3.11）。"""
+    try:
+        with open(path, "r", encoding="utf-8", errors="ignore") as f:
+            lines = f.readlines()
+        return "".join(lines[-n:])
+    except Exception:  # noqa: BLE001
+        return ""
+
+
 def phase7_verify(ctx: Ctx):
     log = ctx.logger
     log.info("P7", "start", "验收")
@@ -735,6 +763,7 @@ def phase8_launch(ctx: Ctx):
     # （端口冲突；且旧实例会响应就绪探测，掩盖新实例启动失败）
     if _port_ready(8188):
         log.ok("P8", "skip", "ComfyUI 已在运行（http://127.0.0.1:8188），跳过启动")
+        ctx.launch_ready = True
         return
     log.info("P8", "start", "后台启动 ComfyUI")
     listen = "0.0.0.0" if ctx.args.listen else "127.0.0.1"
@@ -745,19 +774,36 @@ def phase8_launch(ctx: Ctx):
     if os.name == "nt":
         # DETACHED_PROCESS + stdout/stderr 重定向到日志（v2.3.8：无控制台时
         # 直接 print 可能异常）
-        subprocess.Popen(cmd, creationflags=0x00000008,  # DETACHED_PROCESS
-                         stdout=open(logf, "a"), stderr=subprocess.STDOUT)
+        proc = subprocess.Popen(cmd, creationflags=0x00000008,  # DETACHED_PROCESS
+                                stdout=open(logf, "a"), stderr=subprocess.STDOUT)
     else:
         # start_new_session=True（v2.3.8）：脱离控制组，终端会话关闭/SIGHUP
         # 不再杀死 ComfyUI（等价 nohup）；日志追加不截断（保留历史便于排错）
-        subprocess.Popen(cmd, stdout=open(logf, "a"), stderr=subprocess.STDOUT,
-                         start_new_session=True)
-    # 就绪探测
+        proc = subprocess.Popen(cmd, stdout=open(logf, "a"), stderr=subprocess.STDOUT,
+                                start_new_session=True)
+    # 就绪探测（v2.3.11：超时不得谎报成功）
     if _poll_object_info(8188, 120, "VedaSparseAttention"):
         log.ok("P8", "ready", "ComfyUI 就绪", detail="http://127.0.0.1:8188")
-    else:
-        log.warn("P8", "ready", "未在 120s 内探测到就绪（可能仍在加载模型，请稍候）")
-    log.ok("P8", "done", "启动完成")
+        log.ok("P8", "done", "启动完成")
+        ctx.launch_ready = True
+        return
+    # 未就绪：区分"进程已崩溃"与"仍在加载"
+    rc = proc.poll()
+    tail = _tail_log(logf, 50)
+    if rc is not None:
+        # 进程已退出 = 启动失败（如 CUDA/OOM/依赖错误），必须如实报错而非谎报成功
+        if tail:
+            print("\n----- ComfyUI 启动日志尾部 (run/comfyui.log) -----\n" + tail)
+        log.error("P8", "crash", f"ComfyUI 进程已退出（退出码 {rc}），启动失败",
+                  error_code=701, detail={"log": logf})
+        raise PhaseError(701, f"ComfyUI 启动失败：进程退出码 {rc}，详见 {logf}")
+    # 进程存活但 120s 未就绪：可能大模型加载较慢，转入后台，但不得谎报"已就绪"
+    if tail:
+        print("\n----- ComfyUI 启动日志尾部 (run/comfyui.log) -----\n" + tail)
+    log.warn("P8", "timeout", "120s 内未探测到就绪，ComfyUI 进程仍在运行（可能模型加载较慢）",
+             detail={"log": logf})
+    log.info("P8", "bg", "已转入后台加载，端口就绪前请勿访问；稍后用 run/status.sh 复查")
+    ctx.launch_ready = False
 
 
 # ---------------------------------------------------------------------------
@@ -808,7 +854,30 @@ def run_install(ctx: Ctx, only: set | None = None):
 
 
 def final_summary(ctx: Ctx, mode_label: str):
-    ctx.logger.ok("ALL", "done", f"一键搭建完成（{mode_label}）", detail={
+    ready = getattr(ctx, "launch_ready", None)
+    if ready is True:
+        ctx.logger.ok("ALL", "done", f"一键搭建完成（{mode_label}）", detail={
+            "profile": ctx.profile_name or ctx.state.data.get("install_profile"),
+            "root": ctx.root,
+            "access": "http://127.0.0.1:8188（魔搭经 Web IDE 端口预览/隧道）"})
+        return
+    if ready is False:
+        # v2.3.11：P8 已启动但未确认就绪（进程存活/模型加载慢），诚实提示，不谎报可访问
+        ctx.logger.warn("ALL", "done",
+                        f"搭建流程完成（{mode_label}），但 ComfyUI 端口就绪未确认（可能仍在加载模型）",
+                        detail={
+            "profile": ctx.profile_name or ctx.state.data.get("install_profile"),
+            "root": ctx.root,
+            "access": "http://127.0.0.1:8188（启动中，稍后用 run/status.sh 复查；日志 run/comfyui.log）"})
+        print("\n提示：ComfyUI 已在后台启动，但 120s 内尚未就绪，可能是大模型加载较慢。"
+              "请用 run/status.sh 复查（UP 即代表可访问）；若长时间 DOWN，请查 run/comfyui.log。")
+        return
+    # ready is None：本次根本未执行启动（--no-launch / 仅安装环节 / --mode launch --no-launch）
+    # v2.3.12：不得谎报「可访问」，改为提示用 run/start.sh 启动。
+    ctx.logger.ok("ALL", "done", f"搭建流程完成（{mode_label}，未启动 ComfyUI）", detail={
         "profile": ctx.profile_name or ctx.state.data.get("install_profile"),
         "root": ctx.root,
-        "access": "http://127.0.0.1:8188（魔搭经 Web IDE 端口预览/隧道）"})
+        "start": "run/start.sh 启动（run/status.sh 查状态；run/stop.sh 停止）"})
+    print("\n提示：本次未自动启动 ComfyUI（--no-launch 或仅执行安装环节）。"
+          "如需启动：bash run/start.sh（Windows 双击 run/start.bat），"
+          "并用 run/status.sh 复查（UP 即代表可访问）。")

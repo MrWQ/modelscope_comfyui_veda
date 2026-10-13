@@ -13,8 +13,11 @@
 """
 import os
 import sys
+import json
+import struct
 import tempfile
 import shutil
+from unittest import mock
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
@@ -33,6 +36,33 @@ class L:
     def debug(self, *a, **k): pass
 
 
+# 捕获日志事件（用于 final_summary 三态断言）
+class CapL:
+    def __init__(self):
+        self.events = []
+    def info(self, *a, **k): self.events.append(("info", k))
+    def warn(self, *a, **k): self.events.append(("warn", k))
+    def ok(self, *a, **k): self.events.append(("ok", k))
+    def error(self, *a, **k): self.events.append(("error", k))
+    def debug(self, *a, **k): pass
+
+
+# 带 record_asset/is_asset_done 的假 State（供下载测试）
+class FakeState2:
+    def __init__(self):
+        self.data = {"assets": {}}
+    def load(self): pass
+    def meta_changed(self, *a, **k): return False
+    def set_meta(self, *a, **k): pass
+    def is_asset_done(self, aid, fp):
+        a = self.data.get("assets", {}).get(aid)
+        return bool(a and a.get("status") == "ok" and a.get("fingerprint") == fp)
+    def record_asset(self, aid, status, size=None, fingerprint=None, source=None):
+        self.data.setdefault("assets", {})[aid] = {
+            "status": status, "size": size, "fingerprint": fingerprint,
+            "source": source}
+
+
 # ---------------------------------------------------------------------------
 # 假 Args
 # ---------------------------------------------------------------------------
@@ -47,6 +77,8 @@ class Args:
         self.mode = "auto"
         self.only = None
         self.source_priority = None
+        self.no_launch = False
+        self.listen = False
         self.__dict__.update(kw)
 
 
@@ -123,6 +155,75 @@ def cleanup(ctx):
         shutil.rmtree(ctx.root, ignore_errors=True)
     finally:
         sys.stdin = sys.__stdin__
+
+
+# ---------------------------------------------------------------------------
+# 7) phase8_launch 崩溃/超时/就绪（mock subprocess + 探针）
+# ---------------------------------------------------------------------------
+class FakeProc:
+    def __init__(self, rc):
+        self._rc = rc
+    def poll(self):
+        return self._rc
+
+
+def make_p8_ctx():
+    ctx = phases.Ctx()
+    ctx.root = tempfile.mkdtemp(prefix="veda_p8_")
+    ctx.comfyui_dir = os.path.join(ctx.root, "ComfyUI")
+    ctx.venv_python = sys.executable  # 实际不执行（Popen 被 mock）
+    ctx.manifest = {"assets": []}
+    ctx.manifest_sha1 = "x"
+    ctx.manifest_profiles = PROFILES
+    ctx.state = FakeState()
+    ctx.logger = L()
+    ctx.args = Args(no_launch=False, listen=False)
+    return ctx
+
+
+def test_p8_launch():
+    print("\n[7] phase8_launch 崩溃/超时/就绪")
+    import lib.phases as P
+
+    # 就绪：探针 True → launch_ready=True，不抛错
+    c = make_p8_ctx()
+    with mock.patch.object(P, "_poll_object_info", return_value=True), \
+         mock.patch.object(P, "_port_ready", return_value=False), \
+         mock.patch.object(P, "subprocess") as msp:
+        msp.Popen.return_value = FakeProc(None)
+        phases.phase8_launch(c)
+    check("p8_ready_ok", c.launch_ready is True)
+    cleanup(c)
+
+    # 崩溃：探针 False 且进程已退出 → 抛 PhaseError(701)
+    c = make_p8_ctx()
+    with mock.patch.object(P, "_poll_object_info", return_value=False), \
+         mock.patch.object(P, "_port_ready", return_value=False), \
+         mock.patch.object(P, "subprocess") as msp:
+        msp.Popen.return_value = FakeProc(1)
+        try:
+            phases.phase8_launch(c)
+            check("p8_crash_raises", False)
+        except phases.PhaseError as e:
+            check("p8_crash_raises", e.code == 701)
+    cleanup(c)
+
+    # 存活但超时：探针 False 且进程仍运行 → 不抛错，launch_ready=False（诚实）
+    c = make_p8_ctx()
+    with mock.patch.object(P, "_poll_object_info", return_value=False), \
+         mock.patch.object(P, "_port_ready", return_value=False), \
+         mock.patch.object(P, "subprocess") as msp:
+        msp.Popen.return_value = FakeProc(None)
+        phases.phase8_launch(c)
+    check("p8_alive_timeout_noraise", c.launch_ready is False)
+    cleanup(c)
+
+    # final_summary 在 launch_ready=False 时诚实提示、不抛错
+    c = make_p8_ctx()
+    c.launch_ready = False
+    phases.final_summary(c, "launch-only")
+    check("final_summary_notready_ok", True)
+    cleanup(c)
 
 
 PASS = []
@@ -348,6 +449,122 @@ def test_file_tree():
 
 
 # ---------------------------------------------------------------------------
+# 8) safetensors 数据段完整性校验（v2.3.12：截断但头部合法应判失败）
+# ---------------------------------------------------------------------------
+def make_st(data_len: int) -> bytes:
+    """构造一个合法的单张量 safetensors（header + data_len 字节数据段）。"""
+    header = {"t": {"dtype": "F32", "shape": [data_len // 4],
+                    "data_offsets": [0, data_len]}}
+    raw = json.dumps(header).encode("utf-8")
+    return struct.pack("<Q", len(raw)) + raw + b"\x00" * data_len
+
+
+def test_safetensors_integrity():
+    print("\n[8] safetensors 数据段完整性")
+    import lib.assets as A
+    d = tempfile.mkdtemp(prefix="veda_st_")
+    try:
+        good = os.path.join(d, "good.safetensors")
+        content = make_st(8)
+        with open(good, "wb") as f:
+            f.write(content)
+        check("st_good_true", A.verify_safetensors_header(good) is True)
+        # 头部合法但数据段被截断（模拟下载中断）：尾部少 4 字节
+        trunc = os.path.join(d, "trunc.safetensors")
+        with open(trunc, "wb") as f:
+            f.write(content[:len(content) - 4])
+        check("st_trunc_false", A.verify_safetensors_header(trunc) is False)
+        # 头部长度非法
+        bad = os.path.join(d, "bad.safetensors")
+        with open(bad, "wb") as f:
+            f.write(b"\xff\xff\xff\xff\xff\xff\xff\xff" + b"{}")
+        check("st_badhdr_false", A.verify_safetensors_header(bad) is False)
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
+# ---------------------------------------------------------------------------
+# 9) download_model_asset：恢复完整文件 + 清理残次文件（v2.3.12）
+# ---------------------------------------------------------------------------
+def test_download_recover_and_cleanup():
+    print("\n[9] download_model_asset 恢复/清理")
+    import lib.assets as A
+    root = tempfile.mkdtemp(prefix="veda_dl_")
+    try:
+        asset = {"id": "t1",
+                 "target": "ComfyUI/models/veda/t1.safetensors",
+                 "min_bytes": 0,
+                 "sources": [{"type": "hf", "repo": "x", "file": "t1.safetensors"},
+                             {"type": "hf", "repo": "x", "file": "t1.safetensors"}]}
+        env = {"is_modelscope": False, "gh_proxy_ok": False,
+               "modelscope_cache": None, "hf_cache": None}
+        vdir = os.path.join(root, "ComfyUI", "models", "veda")
+        os.makedirs(vdir, exist_ok=True)
+        target = os.path.join(vdir, "t1.safetensors")
+
+        # 9a 恢复：完整文件已存在但 state 未记录 → 直接复用，不调用下载
+        with open(target, "wb") as f:
+            f.write(make_st(8))
+        state = FakeState2()
+        logger = L()
+        ok, src = A.download_model_asset(asset, root, [], env, True, logger, state)
+        check("dl_recover_ok", ok is True and src == "recovered")
+        check("dl_recover_recorded", state.data["assets"]["t1"]["status"] == "ok")
+
+        # 9b 清理：残次文件存在 → 重试前被删除；第二次源才成功落盘
+        os.remove(target)
+        with open(target, "wb") as f:   # 残次（过小，头部非法）
+            f.write(b"\x00" * 6)
+        state = FakeState2()
+        logger = L()
+        before_exists = []
+        def fake_hf(repo, include, local_dir, endpoint, cache_dir, logger=None, timeout=1800):
+            t = os.path.join(local_dir, include)
+            before_exists.append(os.path.exists(t))  # 进入下载前 target 是否已被清理
+            if len(before_exists) == 1:
+                raise RuntimeError("first source failed (simulated)")
+            # 第二次：写入完整合法文件
+            with open(t, "wb") as f:
+                f.write(make_st(8))
+        with mock.patch.object(A, "_dl_hf", side_effect=fake_hf):
+            ok2, src2 = A.download_model_asset(asset, root, asset["sources"], env, True, logger, state)
+        check("dl_cleanup_then_ok", ok2 is True and src2 == "hf")
+        # 第二次源进入下载前，残次 target 应已被清理（before_exists[1] == False）
+        check("dl_partial_cleaned", len(before_exists) == 2 and before_exists[1] is False)
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
+# ---------------------------------------------------------------------------
+# 10) final_summary 三态：未启动不得谎报可访问 URL（v2.3.12）
+# ---------------------------------------------------------------------------
+def test_final_summary_states():
+    print("\n[10] final_summary 三态（未启动不谎报 URL）")
+
+    # ready=None（--no-launch / 仅安装环节）：不得带 access 字段
+    c = make_p8_ctx(); c.launch_ready = None; cl = CapL(); c.logger = cl
+    phases.final_summary(c, "install：安装+启动")
+    ok_events = [e for e in cl.events if e[0] == "ok"]
+    has_access = any(isinstance(e[1].get("detail"), dict) and "access" in e[1]["detail"]
+                     for e in ok_events)
+    check("fs_none_no_access", has_access is False)
+
+    # ready=True：带 access 字段（已就绪，可访问）
+    c = make_p8_ctx(); c.launch_ready = True; cl = CapL(); c.logger = cl
+    phases.final_summary(c, "launch-only")
+    ok_events = [e for e in cl.events if e[0] == "ok"]
+    has_access = any(isinstance(e[1].get("detail"), dict) and "access" in e[1]["detail"]
+                     for e in ok_events)
+    check("fs_true_has_access", has_access is True)
+
+    # ready=False：warn（诚实未就绪），不抛错
+    c = make_p8_ctx(); c.launch_ready = False; cl = CapL(); c.logger = cl
+    phases.final_summary(c, "launch-only")
+    warn_events = [e for e in cl.events if e[0] == "warn"]
+    check("fs_false_warn", len(warn_events) >= 1)
+
+
+# ---------------------------------------------------------------------------
 def main():
     test_confirm_branches()
     test_e103_no_gpu()
@@ -355,6 +572,10 @@ def main():
     test_e601_external()
     test_compute_cap_ok()
     test_file_tree()
+    test_p8_launch()
+    test_safetensors_integrity()
+    test_download_recover_and_cleanup()
+    test_final_summary_states()
 
     print("\n" + "=" * 60)
     print(f"PASS={len(PASS)}  FAIL={len(FAIL)}")

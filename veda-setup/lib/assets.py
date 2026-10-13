@@ -37,12 +37,33 @@ def compute_manifest_sha1(path: str) -> str:
 # 校验 / 指纹
 # ---------------------------------------------------------------------------
 def verify_safetensors_header(path: str) -> bool:
+    """校验 safetensors 头部 **且** 数据段完整性（v2.3.12 增强）。
+
+    旧实现仅解析头部 JSON，头部合法但 **数据段被截断**（如下载中断，
+    文件大小仍 ≥ min_bytes）会通过校验被记为「ok」，造成「下载不完整却判定成功」。
+    现额外读取张量的 data_offsets 最大值，要求 8 + 头长 + 数据段长 == 实际文件大小。
+    """
     try:
         with open(path, "rb") as f:
             hlen = struct.unpack("<Q", f.read(8))[0]
             if not (0 < hlen < 100_000_000):
                 return False
-            json.loads(f.read(hlen))
+            raw = f.read(hlen)
+            meta = json.loads(raw)
+        max_end = 0
+        for v in meta.values():
+            if isinstance(v, dict) and isinstance(v.get("data_offsets"), (list, tuple)) \
+                    and len(v["data_offsets"]) == 2:
+                try:
+                    end = int(v["data_offsets"][1])
+                except (TypeError, ValueError):
+                    return False
+                if end > max_end:
+                    max_end = end
+        expected = 8 + hlen + max_end
+        actual = os.path.getsize(path)
+        if actual != expected:
+            return False
         return True
     except Exception:  # noqa: BLE001
         return False
@@ -177,6 +198,14 @@ def download_model_asset(asset: dict, root: str, chain: list, env: dict,
         logger.ok("P5", "asset", f"跳过已完成 {asset['id']}")
         return True, None
 
+    # v2.3.12：恢复完整但 state 未记录的文件（上一轮下载成功却写入 state 前中断），
+    # 校验通过直接复用，避免重复下载；校验失败则为残次文件，下方循环前清理重下。
+    if os.path.exists(target) and verify_file(target, asset.get("min_bytes", 0), check_header=True):
+        fp2 = fingerprint(target)
+        state.record_asset(asset["id"], "ok", os.path.getsize(target), fp2, "recovered")
+        logger.ok("P5", "asset", f"恢复已完成文件 {asset['id']}（免重复下载）", detail=target)
+        return True, "recovered"
+
     # ---- 错位文件回收（v2.3.7，实测复盘 E401 根因的善后）----
     # 旧版本把 file 型源下载到 models/ 根，而 target 在子目录 → 下载成功却校验失败。
     # 检测到错位文件（体积/头部均合格）时直接迁移到正确位置，避免重新下载。
@@ -198,6 +227,13 @@ def download_model_asset(asset: dict, root: str, chain: list, env: dict,
     last_err = None
     for src in chain:
         try:
+            # v2.3.12：清理上一步/历史遗留的半截 target——避免 CLI 续传损坏文件，
+            # 或误把残留当作已下载而校验通过（下载不完整却判定成功）。
+            if os.path.exists(target):
+                try:
+                    os.remove(target)
+                except OSError:
+                    pass
             # ---- 下载落点分派（v2.3.7 修正，E401 根因）----
             # CLI --local_dir 会按仓库内路径展开：
             #   include 型源（仓库内带子目录，如 Comfy-Org 的 diffusion_models/xxx）
@@ -280,14 +316,24 @@ def _git_clone(url: str, commit: str | None, dest: str, prox: str | None,
         prefix += ["-c", f'url."{prox}".insteadOf="https://github.com/"']
 
     if os.path.isdir(os.path.join(dest, ".git")):
-        if commit and not commit.startswith("PINNED"):
-            if _git_head(dest) == commit:
+        head = _git_head(dest)
+        if head is None:
+            # v2.3.12：.git 存在但 HEAD 读不出 = 仓库损坏（克隆/检出中断），
+            # 重建后重新获取，而非放任后续 fetch/checkout 反复失败。
+            logger.warn("P1", "repo", f"{repo_spec['id']} 检测到损坏的 .git，重建",
+                        detail=dest)
+            shutil.rmtree(dest, ignore_errors=True)
+        elif commit and not commit.startswith("PINNED"):
+            if head == commit:
                 return  # 已对齐锁定 commit，无需任何网络操作
             subprocess.run(prefix + ["-C", dest, "fetch", "origin", commit],
                            check=True, capture_output=True, text=True, timeout=timeout)
             subprocess.run(["git", "-C", dest, "checkout", commit],
                            check=True, capture_output=True, text=True, timeout=120)
-        return
+            return
+        else:
+            # 无锁定 commit（默认分支）：.git 存在即视为已装（非复现），直接返回
+            return
 
     if commit and not commit.startswith("PINNED"):
         if _looks_like_sha(commit):
