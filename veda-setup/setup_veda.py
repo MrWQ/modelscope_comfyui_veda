@@ -3,7 +3,7 @@
 """Veda-on-ComfyUI 一键搭建 · 主驱动（跨平台，仅标准库）。
 
 人工唯一入口：python setup_veda.py （或经 install.sh / install.bat）。
-设计文档：docs/Veda一键脚本设计文档.md（v2.3.7）。
+设计文档：docs/Veda一键脚本设计文档.md（v2.3.10）。
 
 运行模式（M0，默认 auto）：自动判定是否已安装——
 已安装实例仅启动（跳过 P1–P7 安装段）；未安装则安装+启动。
@@ -62,6 +62,8 @@ def parse_args() -> argparse.Namespace:
                    help="下载后保留模型缓存（默认清理省磁盘）")
     p.add_argument("--listen", action="store_true", help="绑定 0.0.0.0（默认 127.0.0.1）")
     p.add_argument("--interactive", action="store_true", help="退回人工确认模式")
+    p.add_argument("-y", "--yes", action="store_true",
+                   help="自动确认所有交互提示（含无 GPU 时继续安装，不再询问直接继续）")
     p.add_argument("--dry-run", action="store_true", help="只打印动作不落盘")
     p.add_argument("--resume", action="store_true", help="显式续跑（等价幂等重跑）")
     p.add_argument("--deep-verify", action="store_true", help="资产全量哈希校验")
@@ -237,8 +239,23 @@ def main() -> int:
                       + (" → P8 启动" if 8 in only_set else "（不含 P8，不启动）"))
                 return 0
             phases.phase0_preflight(ctx)
+            if ctx.user_aborted:  # v2.3.9/v2.3.10：无 GPU / 算力不足 / 外来 ComfyUI 经询问后用户选择不继续
+                logger.rotate()
+                print("\n已取消安装：环境预检未通过且用户选择不继续"
+                      "（未检测到 GPU / GPU 算力不足 / 安装根存在外来 ComfyUI 等）。"
+                      "（如需继续请加 --yes，或用 --profile 显式指定档位 / --force 覆盖外来 ComfyUI）")
+                return 0
             phases.run_install(ctx, only=only_set)
             if 8 in only_set and not args.no_launch:
+                # v2.3.8：venv 守卫（--only p8 单独执行且 P2 未跑/安装不完整的场景），
+                # 此前 Popen 抛 FileNotFoundError 裸崩为"未预期错误"
+                if not (ctx.venv_python and os.path.exists(ctx.venv_python)):
+                    logger.error("P8", "launch", "--only p8 但 venv 缺失（先执行 --only p2 或完整安装）",
+                                 error_code=701)
+                    print("\n失败：错误码 E701 (701)")
+                    print("原因：--only p8 但 venv 缺失——请先 python setup_veda.py --only p2"
+                          "（建 venv/依赖）或直接完整安装（默认 auto）")
+                    return 701
                 phases.phase8_launch(ctx)
             else:
                 logger.info("P8", "skip", "--only 未包含 p8（或 --no-launch），不启动")
@@ -288,6 +305,12 @@ def main() -> int:
 
         # mode == "install"（auto 未安装 / 显式 install / auto 由 launch 降级）
         phases.phase0_preflight(ctx)
+        if ctx.user_aborted:  # v2.3.9/v2.3.10：无 GPU / 算力不足 / 外来 ComfyUI 经询问后用户选择不继续
+            logger.rotate()
+            print("\n已取消安装：环境预检未通过且用户选择不继续"
+                  "（未检测到 GPU / GPU 算力不足 / 安装根存在外来 ComfyUI 等）。"
+                  "（如需继续请加 --yes，或用 --profile 显式指定档位 / --force 覆盖外来 ComfyUI）")
+            return 0
         phases.run_install(ctx)
         if args.no_launch:
             logger.info("P8", "skip", "按 --no-launch 不启动")

@@ -1,6 +1,7 @@
 """assets.py — 资产下载引擎：模型权重（modelscope/hf）+ repo（git→tarball 降级）。
 
-源链自适应（§9.2）：魔搭实例排除 hf-mirror/huggingface，通用环境保留。
+源链自适应（§9.2）：魔搭实例 huggingface 直连不可达，hf 兜底优先 hf-mirror（实测可达）；
+通用环境 modelscope → hf-mirror（可达时）→ HF 直连（末位）。
 所有下载直落目标目录（不落 /tmp 再拷贝）。校验三件套：存在/大小/头部 JSON。
 """
 from __future__ import annotations
@@ -99,7 +100,19 @@ def resolve_model_chain(asset: dict, network_table: dict, is_modelscope: bool,
                     s2["endpoint"] = "https://gh-proxy.com/https://huggingface.co"
                     chain.append(s2)
     else:
-        chain += [s for s in sources if s.get("type") in ("modelscope", "hf")]
+        # 通用环境（v2.3.8，§9.2）：modelscope → hf-mirror（可达时）→ HF 直连（末位兜底）
+        chain += [s for s in sources if s.get("type") == "modelscope"]
+        if network_table.get("hf-mirror"):
+            for s in sources:
+                if s.get("type") == "hf":
+                    s2 = dict(s)
+                    s2["endpoint"] = "https://hf-mirror.com"
+                    chain.append(s2)
+        for s in sources:
+            if s.get("type") == "hf":
+                s3 = dict(s)
+                s3["endpoint"] = None  # HF 直连（末位）
+                chain.append(s3)
     return chain
 
 
@@ -325,6 +338,13 @@ def _tarball(url: str, ref: str, dest: str, prox: str | None,
         if os.path.exists(dest):
             shutil.rmtree(dest, ignore_errors=True)
         shutil.move(extracted, dest)
+        # 幂等标记（v2.3.8，§8 P1）：tarball 安装无 .git，HEAD 比对不适用；
+        # 写 .tarball-ref（内容=ref），download_repo 据此快速跳过，重试不再重下仓库。
+        try:
+            with open(os.path.join(dest, ".tarball-ref"), "w", encoding="utf-8") as f:
+                f.write(ref or "")
+        except Exception:  # noqa: BLE001
+            pass
 
 
 def download_repo(repo_spec: dict, dest: str, proxy_candidates: list,
@@ -335,12 +355,25 @@ def download_repo(repo_spec: dict, dest: str, proxy_candidates: list,
         logger.warn("P1", "repo", f"commit 为占位哨兵，回退默认分支（不可复现）",
                     detail=repo_spec["id"])
         commit = None
-    # 0) 快速跳过（v2.3.7）：已存在且 HEAD == 锁定 commit → 直接成功，零网络操作
-    if commit and os.path.isdir(os.path.join(dest, ".git")) and _git_head(dest) == commit:
-        if logger:
-            logger.ok("P1", "repo", f"{repo_spec['id']} 已对齐锁定 commit，跳过获取",
-                      detail=commit[:12])
-        return True
+    # 0) 快速跳过（v2.3.7/v2.3.8）：已存在且 HEAD == 锁定 commit（git 安装），
+    #    或 .tarball-ref 标记匹配（tarball 安装，无 .git）→ 直接成功，零网络操作
+    if commit:
+        if os.path.isdir(os.path.join(dest, ".git")) and _git_head(dest) == commit:
+            if logger:
+                logger.ok("P1", "repo", f"{repo_spec['id']} 已对齐锁定 commit，跳过获取",
+                          detail=commit[:12])
+            return True
+        marker = os.path.join(dest, ".tarball-ref")
+        if os.path.isfile(marker):
+            try:
+                with open(marker, "r", encoding="utf-8") as f:
+                    if f.read().strip() == commit:
+                        if logger:
+                            logger.ok("P1", "repo", f"{repo_spec['id']} 已对齐锁定版本（tarball 标记），跳过获取",
+                                      detail=commit[:12])
+                        return True
+            except Exception:  # noqa: BLE001
+                pass
     # 1) git 直连
     try:
         _git_clone(url, commit, dest, None, logger, timeout)

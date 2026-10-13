@@ -2,9 +2,9 @@
 
 | 项目 | 内容 |
 |---|---|
-| 文档版本 | v2.3.7（v2.3.6 + **首次魔搭实例实测反馈修复**：① P5 修复 Veda 预测器下载落点 bug——`file` 型源（仓库根裸文件名）必须以 `--local_dir=<target 父目录>` 下载，`include` 型源（带子目录路径）以 `--local_dir=<root>/ComfyUI/models` 下载，并回收迁移旧版本错位文件；② hf 兜底端点修正——魔搭内 hf 兜底优先 hf-mirror（实测可达），gh-proxy 代理 HF 仅作末位 best-effort；③ P1/P3 增加阶段级快速跳过（git HEAD == 锁定 commit 即跳过，不再重复 fetch）；④ 新增 `--only pN[,pN]` 单环节执行（P0 始终前置，install_completed 不变更） |
+| 文档版本 | v2.3.10（v2.3.9 + **同类"可询问跳过"环节扩展 + 自检修正**：① GPU 算力不足（E102）与原 E601（外来 ComfyUI）由硬退出改为交互询问是否继续/`--yes` 继续（E601 仍支持 `--force`）；② 抽出通用 `_confirm_continue` 助手（GPU/E102/E601 复用）；③ 修正 `compute_cap_ok` 死代码（E102 此前从未触发，与文档不符）；④ 修正诊断包 `_file_tree` Windows 分隔符漏匹配 + venv 片段误写为 `/.venv` 永不跳过；⑤ P7 验收区分"无 CUDA"与"triton 不可用"；⑥ 清理 P0 死返回值） |
 | 日期 | 2026-10-12 |
-| 状态 | 设计定稿（假设已清零：G1–G3 / F11 / F17 / F18 / F19 已实测确认；G4–G7 为运行时探测项，非设计层假设）；v2.3.5 安装/启动分离已随 v2.3.6 完成代码实现（M6 ✅）；v2.3.7 为首次魔搭实例实测反馈修复（E401 落点/源链 + 阶段级快速跳过 + `--only`），代码随本版同步实现 |
+| 状态 | 设计定稿（假设已清零：G1–G3 / F11 / F17 / F18 / F19 已实测确认；G4–G7 为运行时探测项，非设计层假设）；v2.3.5 安装/启动分离已随 v2.3.6 完成代码实现（M6 ✅）；v2.3.7 为首次魔搭实例实测反馈修复（E401 落点/源链 + 阶段级快速跳过 + `--only`），代码随本版同步实现；v2.3.8 为全量代码自检修正（P8 守护/会话脱离/tarball 幂等/通用链兜底等 10 项），代码随本版同步实现；v2.3.9 为无 GPU 交互继续修复（GPU 预检不再直接退出，改询问/`--yes` 继续）；v2.3.10 为同类"可询问跳过"环节扩展（E102 算力不足/E601 外来 ComfyUI 改交互询问）与自检修正（compute_cap_ok 死代码、_file_tree Windows 分隔符、P7 无 CUDA 误报、P0 死返回值清理） |
 | 关联文档 | 评审与优化建议见 `docs/设计方案评审与优化建议.md` |
 | 首选部署目标 | **魔搭社区（ModelScope）Notebook 免费实例**，持久化目录 `/mnt/workspace` |
 | 本地开发工作区 | `D:/ai_desktop_project/buddy/modelscope_comfyui` |
@@ -284,7 +284,11 @@ veda-setup/                        # 交付仓库根（魔搭实例建议 /mnt/w
 
 ### P0 预检
 - 平台/架构识别；Python 探测（Windows 依次 `py -3`/`python`，其余 `python3`/`python`；要求 3.10–3.12）；git 存在性（缺失不阻塞，走 tarball 安装路径）；
-- GPU：`nvidia-smi` → 名称/显存/计算能力（< SM80 报 E102 退出；无 GPU 报错并提示 CPU 模式不可用）；**默认 Profile 严格按实测显存映射**（<16GB→lowvram、16–24GB→standard、>24GB→full），**设计层不假设任何 GPU 型号**；A10 仅是魔搭免费实例的实测硬件，standard 是其在 24GB 下的预期档位，最终由运行时确认（F14/G6）；
+- GPU：`nvidia-smi` → 名称/显存/计算能力。**"环境不满足但可询问继续"的环节（v2.3.9/v2.3.10）统一走通用 `_confirm_continue`**：dry-run→继续；`--yes`→继续；TTY→询问 `[y/N]`（默认不继续）；非交互无 `--yes`→打印说明后干净退出（返回 0，不抛错）。适用于：① **无 NVIDIA GPU**（E103，沿用 fallback 档 `standard`）；② **GPU 算力 < SM80**（E102，Veda Triton INT8 后端需 SM80+，低算力可能无法出片）；③ **安装根存在非本脚本建立的 ComfyUI**（E601，覆盖继续；`--force` 等同 `--yes` 直接继续）。具体：
+  - 无 GPU：自动档（`--profile auto`）未检测到 NVIDIA GPU 时交互询问 `仍继续安装（将使用 standard 档）？[y/N]`；用户确认或 `--yes` 后沿用 fallback 档 `standard` 继续（Veda 需 GPU 才能运行，CPU 模式不可用，无 GPU 安装仅用于准备环境/预下载，运行时仍需 GPU）；显式 `--profile X` 跳过询问直接采用指定档位。
+  - 算力不足（< SM80）：GPU 已检测但 `compute_cap_ok` 为 False 时同样交互询问是否继续（v2.3.10 起；此前 `compute_cap_ok` 为死代码、E102 从未触发，与文档"报 E102 退出"不符，现已修正为可询问）。
+  - 外来 ComfyUI：安装根已存在且非本脚本 `.git` 仓库时交互询问是否覆盖继续（v2.3.10 起；此前直接 E601 退出）。
+  - **默认 Profile 严格按实测显存映射**（<16GB→lowvram、16–24GB→standard、>24GB→full），**设计层不假设任何 GPU 型号**；A10 仅是魔搭免费实例的实测硬件，standard 是其在 24GB 下的预期档位，最终由运行时确认（F14/G6）；
 - 磁盘：**可用空间 vs（模型体积 + ComfyUI ~3GB + venv ~3GB + 缓存预留 ~1.5×模型，见 §6 规则8/9）**，按真实 `Content-Length` 汇总；低于阈值自动降档并 WARN（E1）；
 - 网络探测：`modelscope.cn`、`hf-mirror.com`、`huggingface.co`、`github.com`、`gh-proxy.com` 等，生成《源可用性表》；**魔搭实例内 huggingface.co 直连受限（F17+2026-10-12 实测），但 hf-mirror 实测可达**——模型源链为 `modelscope → hf-mirror → gh-proxy 代理 HF(末位)`，代码源链为 `github 直连(首位尝试) → gh-proxy → codeload(末位)`；通用环境为 `modelscope → hf-mirror → huggingface`（E5/E6，详见 §9.2）；
 - **魔搭实例识别**：存在 `/mnt/workspace` 且镜像预装 torch → 标记 `env=modelscope`，后续复用系统 torch，并**强制 `--local-code` 关闭**（E3）；
@@ -295,6 +299,7 @@ veda-setup/                        # 交付仓库根（魔搭实例建议 /mnt/w
 - state 记录版本；**manifest 锁定已知可用 commit（可复现，防上游破坏）**；已安装且 ≥0.38.0 → 跳过；已安装但更低 → `git fetch` + `git checkout <commit>` 升级；未安装/升级 → 按锁定 commit 获取（**SHA 不能 `--depth 1 --branch` 后 checkout——浅克隆不含历史 commit 会失败**），正确做法：`git clone --filter=blob:none --no-checkout <url> <dest>` → `git -C <dest> fetch origin <commit>` → `git -C <dest> checkout <commit>`（blobless，不全量历史）；**GitHub 经 gh-proxy 代理**：临时 `git config url."https://gh-proxy.com/https://github.com/".insteadOf "https://github.com/"`，仅局部/本次会话，用完还原，禁止 Token（E6）；git 失败降级 tarball：`https://<proxy>/https://github.com/<repo>/archive/<commit>.tar.gz`（**注意用 commit SHA 而非分支名，保证可复现**，多代理候选依次尝试）；两者都失败才 E201；
 - 非 git 的外来安装 → E601。
 - **阶段级快速跳过（v2.3.7，重试提速）**：`ComfyUI/.git` 存在且 `git rev-parse HEAD` == manifest 锁定 commit → P1 整体直接跳过（不 fetch、不探测代理——魔搭内 git 直连必失败，重复 fetch 是纯浪费）；仅 HEAD 不匹配或目录缺失时才进入获取/升级链。`_git_clone` 对已存在仓库同样先比对 HEAD，匹配即返回。
+- **tarball 幂等标记（v2.3.8）**：tarball 兜底安装的仓库**无 `.git`**（HEAD 比对不适用，且 `is_installed()` 按设计要求 `.git` 存在）——旧实现下重试会 rmtree 重下整个仓库。修正：tarball 解压后在仓库根写入标记文件 `.tarball-ref`（内容=ref/commit）；`download_repo` 快速跳过条件扩展为「`.git`+HEAD 匹配 **或** `.tarball-ref` 匹配」，命中即零网络跳过（commit 变更时标记不匹配，自然走重下链）。
 
 ### P2 运行依赖
 - venv：魔搭/系统有 torch 时用 `--system-site-packages` 复用（**省去数 GB torch 下载**），否则按 CUDA 版本装官方 wheel；torch 升级只进 venv，不动系统包；
@@ -346,7 +351,10 @@ veda-setup/                        # 交付仓库根（魔搭实例建议 /mnt/w
 - 结果写入 state 与日志；任一项失败 → 错误码 + 诊断包。
 
 ### P8 启动
-- 生成 `run/start.sh|stop.sh|status.sh`（Windows 为 `.bat`）；`start.sh` 以 **`nohup ... > run/comfyui.log 2>&1 &` 后台启动**并写 pid 文件，`status.sh` 查健康、`stop.sh` 停止（E4：避免前台启动卡死安装命令，安装命令可立即返回）；
+- 生成 `run/start.sh|stop.sh|status.sh`（Windows 为 `.bat`）；`start.sh` 以 **`nohup ... >> run/comfyui.log 2>&1 &` 后台启动**并写 pid 文件，`status.sh` 查健康、`stop.sh` 停止（E4：避免前台启动卡死安装命令，安装命令可立即返回）；
+- **已运行守护（v2.3.8）**：启动前先探测 `http://127.0.0.1:8188/object_info`——**已就绪则跳过启动**（记 `P8/skip`），避免已安装实例重复执行命令时二次拉起实例（端口冲突，且旧实例响应就绪探测会掩盖新实例启动失败）；`run/start.sh` 同样内置该守护（UP 即退出）；
+- **会话脱离（v2.3.8）**：安装期首启（P8 直接 Popen）POSIX 侧使用 `start_new_session=True`（等价 nohup，脱离控制组），**终端会话关闭/SIGHUP 不再杀死 ComfyUI**；Windows 侧重定向 stdout 到 `run/comfyui.log`（DETACHED_PROCESS 无控制台，直接 print 可能异常）；日志统一**追加**（不截断，保留历史便于排错）；
+- Windows `stop.bat` 用 PowerShell 按 `CommandLine` 匹配 `main.py` 精确停止（v2.3.8；旧 `taskkill /FI WINDOWTITLE` 匹配不到无窗口的 python.exe）；
 - **默认绑定 `127.0.0.1`**，通过 Web IDE 端口预览/隧道访问（云实例暴露面最小化）；仅 `--listen` 时绑 `0.0.0.0:8188`；
 - 后台启动后轮询 `/object_info` 探测就绪（复用 P7 逻辑，超时仅 WARN），就绪后打印访问 URL/端口与《使用摘要》：模板入口、默认参数（稀疏度 90%/90%）、避坑提醒、`Ctrl+B` 对比法、日志与诊断包位置。
 
@@ -408,7 +416,8 @@ launch 路径（auto 判定为已安装，或显式 `--mode launch`）**不跑 P
                    （github 直连不稳定——2026-10-12 实测时而通时而不通，直连仅作首位尝试）
   魔搭实例·模型源:  modelscope → hf-mirror（实测可达，优先兜底）→ gh-proxy 代理 HF（末位 best-effort）
                    （huggingface.co 直连实测不可达；hf-mirror 实测可达——v2.3.7 依实测修正，旧版"排除 hf-mirror"作废）
-  通用环境·模型源:  modelscope → hf-mirror → huggingface
+  通用环境·模型源:  modelscope → hf-mirror（探测可达时）→ huggingface 直连（末位）
+                   （v2.3.8：hf-mirror 不可达时跳过之直接 HF 直连——海外用户镜像反而绕路；hf 直连始终作末位兜底）
 state 以资产为最小粒度记录（见 §6 规则5），中断恢复精确到单个文件
 对每个资产：按候选链逐源尝试 → 成功即校验 → 通过则落盘写 state；全部失败 → E401 + 诊断包
 下载落点：include 型源 --local_dir=<root>/ComfyUI/models；file 型源 --local_dir=<target 父目录>（§8 P4）
@@ -609,3 +618,6 @@ bash veda-setup/install.sh
 | v2.3.5 | **安装/启动分离与已安装自动判定（设计层，代码待 M6 实现）**：① 新增 M0 运行模式判定（§8）：`--mode {auto,install,launch}`，默认 `auto`——据 `is_installed()` 自动分流，已安装实例仅启动（跳过 P1–P7 安装段），新实例自动安装+启动；② `is_installed()` 四项判定（纯文件系统 + state，无网络/外部假设）：`install_completed=true` ∧ `manifest_sha1` 一致 ∧ `ComfyUI/.git` 存在 ∧ `Veda-on-ComfyUI/.git` 存在；③ state 顶层新增 `install_completed`/`install_profile`，安装段（P0–P7）全部成功后写入（§6 规则3）；④ 新增 launch 专用轻量预检（只读：env + venv 路径校验 + `main.py` 存在性，不跑磁盘/网络/降档、不创建 venv）；**预检失败分流：auto 自动降级转安装段（幂等增量，仅重建失效 venv，不重下模型），仅显式 `--mode launch` 报 E701**——覆盖"新实例镜像 Python 变化致 venv 失效"场景（F11/§10），不让用户被 E701 卡死；⑤ 新增 E701 错误码（仅限显式 launch）与 `MODE_DECISION` 日志事件（含 `fallback_reason`）；⑥ 同步更新 §1.2 目标、§4 映射表、§5 架构图、§7.2 参数表、§7.3 默认行为表、§8 流程图与 P0 措辞（锁在驱动入口先于 M0 获取）、§11.2、§13 DoD（新增安装/启动分离验收项，含 venv 失效降级用例）、§14.1/14.3 使用说明、§15 新增 M6 里程碑。**自检修正**：`--mode install` 统一表述为「强制进入安装段（幂等增量）」而非「强制重装」（避免误导全量重下）；轻量预检由 `ensure_venv`（缺失时会创建，有写副作用）改为 `venv_python()` 仅解析路径+校验 |
 | v2.3.6 | **M6 代码实现落地（按 v2.3.5 设计，无新增外部假设）**：① `lib/diag.py`：注册 E701；`State` 默认数据含 `install_completed=false`/`install_profile=null`（损坏重置分支同步）；② `lib/phases.py`：新增 `is_installed()`（四项判定）、`decide_mode()`（M0 模式映射 + `MODE_DECISION` 事件 + 显式 launch 未安装即 E701）、`preflight_launch()`（只读轻量预检：env + `venv_python()` 路径校验 + `main.py` 存在性，失败抛 701，auto 由上层降级）；`run_phases` 重构为 `run_install`（P1–P7 + **进入时复位 `install_completed=false`** + 成功后置 `true` 并记 `install_profile`），P8 启动段独立由驱动调用；③ `setup_veda.py`：新增 `--mode {auto,install,launch}`；主流程重构为「锁 → M0 判定 → launch 路径（轻量预检→P8，auto 预检失败自动降级转安装段并记 `fallback_reason`）／install 路径（P0→run_install→P8）」；dry-run 输出模式判定；清理 `version_snapshot` 中已废弃的 `ComfyUI-MiniMaxH3` 死引用；④ 使用说明/问题排错/README 同步 `--mode`、E701 与自动分流说明。本地校验：py_compile 全通过；自测覆盖 is_installed 四分支/decide_mode 全映射/701 抛出/复位落盘/argparse 语义 |
 | v2.3.7 | **首次魔搭真实实例实测反馈修复（E401 复盘，代码随本版实现）**：实测环境：魔搭 A10 24GB / `/mnt/workspace` / P0–P4 一次通过（档位 standard、缓存重定向、stale 锁自动释放均符合设计）。**根因修正**：① P5 `veda-predictor-t2va` E401——`download_model_asset` 把 `file` 型源（Veda 预测器，仓库根裸文件名）统一下载到 `--local_dir models/` 根，而 target 在 `models/veda/` 子目录，**下载成功但落错位置致校验失败**（魔搭 API 实测两预测器仓库/文件均存在：t2va=275,415,648B、r2va=275,415,752B，min_bytes 下界有效，排除大小问题）；修正为按源类型分派 local_dir（§8 P4 落点规则）+ 错位文件迁移回收（不重下）；② hf 兜底端点错误——魔搭内被改写为 gh-proxy 代理 HF（不代理 HF，必失败）而 hf-mirror 实测可达；修正源链为 `modelscope → hf-mirror → gh-proxy HF(末位)`（§9.2/P0/P4/P5 同步）；③ 重试无阶段级跳过——P1 旧跳过条件 `not meta_changed("","","")` 恒 False（state 真实元数据 vs 空串永不等），每次重试重复 fetch（魔搭 git 直连必败，纯浪费）；P3 依赖每次重装；修正为 commit 匹配快速跳过（P1/P3/`_git_clone` 三层）+ `.veda-req-done` 标记判重；④ 新增 `--only pN[,pN]` 单环节执行（§7.2/M0：P0 前置、install_completed 不变更、未含 p8 不启动）。 |
+| v2.3.8 | **全量代码自检修正（代码随本版实现）**：P0 级——① **P8 重复启动缺陷**：已安装实例在 ComfyUI 运行中重跑命令会二次拉起实例（端口冲突，旧实例响应 `/object_info` 掩盖新实例失败）→ P8/start.sh 增加「已就绪即跳过」守护；② **安装期首启无会话脱离**：POSIX 直接 Popen 无 `start_new_session`，魔搭 Web IDE 终端关闭（SIGHUP）会杀死 ComfyUI → 修复；Windows DETACHED_PROCESS 未重定向 stdout → 重定向到日志；③ `profiles.json` 残留过期假设（"约 55GB；VRAM 可行性假设 A1"——v2.3.3 已删；minimal 档描述"--skip-models 默认生效"不实）→ 清理。P1 级——④ 通用环境模型源链缺 HF 直连末位兜底（manifest endpoint 全为 hf-mirror，镜像故障无后路）→ 补齐（§9.2）；⑤ P0 磁盘降档 `set_meta` 后缀不一致（丢 `/modelscope`）→ 元数据每次运行来回翻转 → 修正；⑥ `--only p3/p7/p8` 在 venv 缺失时 FileNotFoundError 裸崩 → 守卫（P3/P7 warn 跳过对应检查，P8 报 E701）；⑦ P2 二次 pip 失败冒泡为"未预期错误"（无错误码）→ 补 E203；⑧ Windows `stop.bat` 的 `taskkill /FI WINDOWTITLE` 匹配不到无窗口 python.exe → 改 PowerShell 按 CommandLine 匹配 `main.py`；⑨ tarball 兜底安装无 `.git`，重试每次 rmtree 重下仓库 → `.tarball-ref` 幂等标记（§8 P1）；⑩ dry-run 的 P0 `makedirs(pip_cache)` 落盘副作用 → 跳过。P2 级（记录不改）——`comfyui.log` 由截断改追加；`_file_tree` 的 `/.git` 分隔符 Windows 失效（仅诊断包）；Windows 退出码 701→189 截断（平台限制，排错文档已注明）。 |
+| v2.3.9 | **无 GPU 交互继续（代码随本版实现）**：P0 GPU 预检此前在无 NVIDIA GPU 时直接 `PhaseError(103)` 退出，用户期望"先问是否继续"。修正（`lib/phases.py` `phase0_preflight` + 新增 `_confirm_no_gpu_continue`；`setup_veda.py` 新增 `-y/--yes`；`lib/diag.py` E103 改为"非致命、交互询问"注释）：① 自动档（`--profile auto`）无 GPU 不再直接退出——终端 TTY 下交互询问 `仍继续安装（将使用 standard 档）？[y/N]`（默认不继续）；② `--yes`（`-y`）直接继续（无交互自动确认，含非交互场景）；③ 非交互且无 `--yes` → 打印可操作说明后**干净退出（返回 0）**，不抛错误、不挂起；④ 用户确认/`--yes` 后沿用 fallback 档 `standard` 继续安装（Veda 需 GPU 才能运行，无 GPU 安装仅用于准备环境/预下载）；⑤ 显式 `--profile X` 仍跳过询问直接采用指定档位；⑥ dry-run 仅展示计划（不询问、不中止）。错误码 E103 不再作为致命错误抛出（用户拒绝为干净退出，非 E103 失败）。本地校验：py_compile 全过；自测 `_confirm_no_gpu_continue` 6 分支（dry-run/--yes/非交互/TTY-y/TTY-n/TTY-空）全绿；`phase0_preflight` 无 GPU 集成测试 5 场景（非交互中止/--yes→standard/显式 minimal/ TTY-y→standard /TTY-n 中止）全绿。 |
+| v2.3.10 | **同类"可询问跳过"环节扩展 + 自检修正（代码随本版实现）**：① **E102 算力不足改交互询问**：`platform.compute_cap_ok` 此前为死代码（从未调用，与文档"报 E102 退出"不符），修正——GPU 已检测但 `compute_cap_ok` 为 False（< SM80）时同样走通用 `_confirm_continue`，不再直接退出；② **E601 外来 ComfyUI 改交互询问**：安装根存在且非本脚本 `.git` 仓库时由硬 `raise E601` 改为 `_confirm_continue`（默认不继续；`--yes`/`--force` 直接继续）；③ **抽出通用 `_confirm_continue(ctx, prompt)`** 助手，GPU/E102/E601 三处复用（原 `_confirm_no_gpu_continue` 移除）；④ **`_file_tree` 诊断包修正（v2.3.8 已知 P2）**：跨平台用 `os.sep→"/` 归一化再做片段匹配（Windows 原生 `\\` 旧实现漏匹配，且 venv 片段误写为 `/.venv` 永不匹配，导致 venv/cache 内成千上万文件被全量列出、诊断包膨胀）；⑤ **P7 验收区分"无 CUDA"与"triton 不可用"**，避免无 GPU 安装时误报 triton；⑥ 清理 P0 `return ctx` 死返回值。`Ctx.user_aborted` 统一承载 GPU/E102/E601 的"用户拒绝"干净退出（驱动层返回 0）。本地校验：py_compile 全过；自测 `_confirm_continue` 6 分支全绿；`phase0_preflight` 集成测试扩展至 7 场景（无 GPU 非交互中止 / 无 GPU `--yes`→standard / 显式 minimal / TTY-y→standard / TTY-n 中止 / **E102 非交互中止 / E102 `--yes` 继续**）/ **E601 非交互中止 / E601 `--force` 继续**）。 |

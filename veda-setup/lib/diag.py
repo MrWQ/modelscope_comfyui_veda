@@ -23,8 +23,11 @@ import platform as _platform
 ERROR_CODES = {
     0:   ("SUCCESS", "成功"),
     101: ("E101", "操作系统不受支持"),
-    102: ("E102", "GPU 计算能力 < SM80 或非 NVIDIA"),
-    103: ("E103", "未检测到 GPU（CPU 模式不可用）"),
+    102: ("E102", "GPU 计算能力 < SM80（非 NVIDIA 或老卡）；v2.3.10 起不再作为致命错误——"
+                  "自动档改为交互询问是否继续（默认不继续），--yes 直接继续，用户拒绝为干净退出(返回0)"),
+    103: ("E103", "未检测到 GPU（CPU 模式不可用）；v2.3.9 起不再作为致命错误——"
+                  "自动档无 GPU 改为交互询问是否继续（默认不继续），--yes 直接继续，"
+                  "用户拒绝为干净退出(返回0)而非 E103"),
     104: ("E104", "磁盘可用空间不足"),
     105: ("E105", "安装根不可写"),
     106: ("E106", "所有下载源网络全不可达"),
@@ -39,7 +42,8 @@ ERROR_CODES = {
     501: ("E501", "验收：版本/资产缺失"),
     502: ("E502", "验收：triton 不可用"),
     503: ("E503", "验收：object_info 无 Veda/加载器节点"),
-    601: ("E601", "安装根存在外来 ComfyUI"),
+    601: ("E601", "安装根存在外来 ComfyUI；v2.3.10 起不再作为致命错误——"
+                  "改为交互询问是否覆盖继续（默认不继续），--yes/--force 直接继续"),
     602: ("E602", "安装根无写权限"),
     603: ("E603", "并发锁冲突（另一安装进行中）"),
     701: ("E701", "运行模式：--mode launch 但安装不完整"),
@@ -206,12 +210,14 @@ def _file_tree(root: str, max_files: int = 2000) -> str:
     out = []
     count = 0
     for dirpath, dirnames, filenames in os.walk(root):
-        # 跳过缓存与 venv 细节（仅列顶层结构，控制体积）
-        if any(seg in dirpath for seg in ("/.git", "/.cache", "/venv")):
-            if "/.cache" in dirpath or "/venv" in dirpath:
-                out.append(f"{dirpath}/  (skipped)")
-                dirnames[:] = []
-                continue
+        # 跳过缓存与 venv 细节（仅列顶层结构，控制体积）；v2.3.10 修正：
+        # 跨平台统一用 "/" 归一化路径再做片段匹配（Windows 原生为 "\\"，旧实现漏匹配，
+        # 且 venv 片段误写为 "/.venv" 永不匹配，导致 venv/cache 内文件被全量列出、诊断包膨胀）。
+        norm = dirpath.replace(os.sep, "/")
+        if "/.git" in norm or "/.cache" in norm or "/venv" in norm:
+            out.append(f"{dirpath}/  (skipped)")
+            dirnames[:] = []
+            continue
         depth = dirpath.replace(root, "").count(os.sep)
         if depth > 3:
             continue

@@ -3,13 +3,13 @@
   "default_auto": true,
   "profiles": {
     "minimal": {
-      "desc": "最小：仅 Veda 加速节点 + 预测器，不含主模型（--skip-models 默认生效）",
+      "desc": "最小：仅 Veda 加速节点 + 预测器，不含主模型（models=false，P5 自动跳过）",
       "models": false,
       "vram_min_gb": 12,
       "asset_ids": ["veda-predictor-t2va"]
     },
     "standard": {
-      "desc": "标准：int8 DiT + 32B nvfp4 编码器（A10 24GB 适配，约 55GB；VRAM 可行性假设 A1，待 M4/G6 实测）",
+      "desc": "标准：int8 DiT + 32B nvfp4 编码器（A10 24GB 适配，稳定占用约 42GB；档位由 P0 实测显存映射，磁盘不足自动降档）",
       "models": true,
       "vram_min_gb": 16,
       "asset_ids": ["veda-predictor-t2va", "h3-dit-int8", "h3-te-nvfp4", "h3-vae-audio", "h3-vae-video", "h3-turbo-lora"]

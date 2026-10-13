@@ -48,6 +48,7 @@ class Ctx:
         self.hf_cache = None
         self.pip_cache = None
         self.plan = []
+        self.user_aborted = False  # v2.3.9：无 GPU 经询问后用户选择不继续
 
 
 # ---------------------------------------------------------------------------
@@ -161,6 +162,37 @@ def preflight_launch(ctx: Ctx):
 # ---------------------------------------------------------------------------
 # P0 预检
 # ---------------------------------------------------------------------------
+def _confirm_continue(ctx: "Ctx", prompt: str) -> bool:
+    """通用交互询问是否继续（v2.3.9/v2.3.10）：用于"环境可能不满足但允许用户选择继续"的环节
+    （如未检测到 GPU / GPU 算力不足 / 安装根存在外来 ComfyUI），替代旧版直接 PhaseError 退出。
+
+    - dry-run：始终返回 True（仅展示计划，不询问、不中止）
+    - --yes：直接继续（无交互自动确认；含非交互场景）
+    - 交互 TTY：询问 [y/N]，默认不继续
+    - 非交互且无 --yes：打印说明后返回 False（由上层以干净退出处理，不抛错误）
+
+    prompt 为展示给用户的询问文案（不含末尾 [y/N]）。
+    """
+    if ctx.args.dry_run:
+        return True
+    if ctx.args.yes:
+        ctx.logger.info("P0", "confirm", "--yes 已给，继续", detail={"prompt": prompt})
+        return True
+    if sys.stdin.isatty():
+        try:
+            ans = input(f"\n⚠ {prompt} [y/N] ").strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            ans = ""
+        if ans in ("y", "yes", "是"):
+            ctx.logger.info("P0", "confirm", "用户确认继续", detail={"prompt": prompt})
+            return True
+        ctx.logger.info("P0", "confirm", "用户选择不继续", detail={"prompt": prompt})
+        return False
+    # 非交互、未给 --yes：不挂起、不硬失败，给出说明后中止
+    ctx.logger.warn("P0", "confirm", "非交互无 --yes，跳过", detail={"prompt": prompt})
+    return False
+
+
 def phase0_preflight(ctx: Ctx):
     log = ctx.logger
     log.info("P0", "start", "预检开始")
@@ -184,7 +216,8 @@ def phase0_preflight(ctx: Ctx):
         ctx.modelscope_cache = os.path.join(ctx.root, ".cache", "modelscope")
         ctx.hf_cache = os.path.join(ctx.root, ".cache", "huggingface")
         ctx.pip_cache = os.path.join(ctx.root, ".cache", "pip")
-    os.makedirs(ctx.pip_cache, exist_ok=True)
+    if not ctx.args.dry_run:  # v2.3.8：dry-run 只打印动作，不落盘建目录
+        os.makedirs(ctx.pip_cache, exist_ok=True)
 
     # GPU → 决定 Profile
     gpu = platform.detect_gpu()
@@ -195,15 +228,32 @@ def phase0_preflight(ctx: Ctx):
 
     if ctx.args.profile == "auto" or not ctx.args.profile:
         if not gpu:
-            raise PhaseError(103, "未检测到 GPU 且 CPU 模式不可用，请使用带 NVIDIA GPU 的环境")
-        vram = gpu["vram_gb"]
-        if vram < 16:
-            ctx.profile_name = "lowvram"
-        elif vram <= 24:
-            ctx.profile_name = "standard"
+            # v2.3.9：无 GPU 不再直接 PhaseError(103) 退出，改为交互询问 / 按 --yes 继续
+            fallback = "standard"
+            if not _confirm_continue(ctx,
+                    f"未检测到 NVIDIA GPU（Veda 需 GPU 才能运行，CPU 模式不可用）。"
+                    f"仍继续安装（将使用 {fallback} 档）？"):
+                ctx.user_aborted = True
+                return
+            ctx.profile_name = fallback
+            log.warn("P0", "profile", "无 GPU 沿用 fallback 档", detail=fallback)
         else:
-            ctx.profile_name = "full"
-        log.info("P0", "profile", "按实测 VRAM 选档", detail=ctx.profile_name)
+            vram = gpu["vram_gb"]
+            if vram < 16:
+                ctx.profile_name = "lowvram"
+            elif vram <= 24:
+                ctx.profile_name = "standard"
+            else:
+                ctx.profile_name = "full"
+            log.info("P0", "profile", "按实测 VRAM 选档", detail=ctx.profile_name)
+            # v2.3.10：GPU 算力不足（< SM80）不再直接 PhaseError(102)，改为询问是否继续
+            if not platform.compute_cap_ok(gpu):
+                if not _confirm_continue(ctx,
+                        "GPU 计算能力 < SM80（Veda Triton INT8 后端需 SM80+，低算力可能无法出片）。"
+                        "仍继续安装？"):
+                    ctx.user_aborted = True
+                    return
+                log.warn("P0", "gpu", "用户确认在低算力 GPU 上继续安装")
     else:
         ctx.profile_name = ctx.args.profile
 
@@ -226,10 +276,17 @@ def phase0_preflight(ctx: Ctx):
     # venv 路径解析（只读，不创建；供 --only p7/p8 单环节执行时 P2 未跑的场景使用）
     ctx.venv_python = platform.venv_python(ctx.root)
 
-    # 外部 ComfyUI 检测（E601）
-    if os.path.isdir(ctx.comfyui_dir) and not os.path.isdir(os.path.join(ctx.comfyui_dir, ".git")) \
-            and not ctx.args.force:
-        raise PhaseError(601, f"安装根已存在非本脚本建立的 ComfyUI：{ctx.comfyui_dir}（换 --install-root 或 --force）")
+    # 外部 ComfyUI 检测（v2.3.10：不再直接 E601 退出，改为交互询问 / --yes / --force 继续）
+    if os.path.isdir(ctx.comfyui_dir) and not os.path.isdir(os.path.join(ctx.comfyui_dir, ".git")):
+        if ctx.args.force:
+            log.warn("P0", "comfyui", "检测到非本脚本建立的 ComfyUI，--force 覆盖继续",
+                     detail=ctx.comfyui_dir)
+        elif not _confirm_continue(ctx,
+                f"安装根已存在非本脚本建立的 ComfyUI：{ctx.comfyui_dir}。是否覆盖并继续安装？"):
+            ctx.user_aborted = True
+            return
+        else:
+            log.warn("P0", "comfyui", "用户确认覆盖外来 ComfyUI 继续安装", detail=ctx.comfyui_dir)
 
     # state 加载与元数据比对
     ctx.state.load()
@@ -260,11 +317,13 @@ def phase0_preflight(ctx: Ctx):
                 ctx.profile = profiles["lowvram"]
             else:
                 raise PhaseError(104, f"磁盘可用空间不足：{free} < {stable}")
-            ctx.state.set_meta(ctx.env["os"], ctx.profile_name, ctx.manifest_sha1)
+            # v2.3.8：修正后缀不一致（此前丢 "/modelscope" 后缀，导致元数据
+            # 每次运行在两种形态间来回翻转、反复记"元数据变化"）
+            ctx.state.set_meta(ctx.env["os"] + ("/modelscope" if is_ms else ""),
+                               ctx.profile_name, ctx.manifest_sha1)
 
     log.ok("P0", "done", "预检完成", detail={"profile": ctx.profile_name,
                                               "is_modelscope": is_ms})
-    return ctx
 
 
 # ---------------------------------------------------------------------------
@@ -307,8 +366,13 @@ def phase2_deps(ctx: Ctx):
             log.warn("P2", "pip", "pip 安装失败，尝试重建 venv", detail=e.stderr[-300:])
             shutil.rmtree(os.path.join(ctx.root, "venv"), ignore_errors=True)
             ctx.venv_python = platform.ensure_venv(ctx.root, ctx.system_site_packages, log)
-            subprocess.run([ctx.venv_python, "-m", "pip", "install", "-r", req],
-                           env=env, check=True, capture_output=True, text=True, timeout=1800)
+            try:
+                subprocess.run([ctx.venv_python, "-m", "pip", "install", "-r", req],
+                               env=env, check=True, capture_output=True, text=True, timeout=1800)
+            except subprocess.CalledProcessError as e2:
+                # v2.3.8：二次失败给出明确错误码（此前冒泡为"未预期错误"，无 E203）
+                raise PhaseError(203, f"ComfyUI 依赖安装失败（venv 重建后仍失败）："
+                                      f"{(e2.stderr or '')[-200:]}")
             log.ok("P2", "venv", "venv 重建并重装完成（REBUILD_VENV）")
     # Windows triton 修复
     if os.name == "nt":
@@ -354,7 +418,12 @@ def phase3_nodes(ctx: Ctx):
     else:
         req = os.path.join(veda_dir, "requirements.txt")
         req_ok = True
-        if os.path.exists(req):
+        # v2.3.8：venv 缺失守卫（--only p3 跳过 P2 的场景）——此前 subprocess
+        # 抛 FileNotFoundError 裸崩为"未预期错误"
+        if not (ctx.venv_python and os.path.exists(ctx.venv_python)):
+            req_ok = False
+            log.warn("P3", "req", "venv 缺失（如 --only p3 未先执行 P2），跳过节点依赖安装")
+        if req_ok and os.path.exists(req):
             env = os.environ.copy()
             env["PIP_CACHE_DIR"] = ctx.pip_cache
             try:
@@ -369,7 +438,7 @@ def phase3_nodes(ctx: Ctx):
         # FA4 运行时（best-effort 可选增强，§8 P3）：若节点含 install_fa4.py 则尝试其自测，
         # 失败不阻断主流程（默认 Triton INT8 后端由节点自带内核 + Triton 提供，SM80+ 即可）。
         fa4 = os.path.join(veda_dir, "install_fa4.py")
-        if os.path.exists(fa4):
+        if os.path.exists(fa4) and ctx.venv_python and os.path.exists(ctx.venv_python):
             try:
                 log.info("P3", "fa4", "检测到 install_fa4.py，best-effort 运行自测（可选加速，失败不阻断）")
                 subprocess.run([ctx.venv_python, fa4], check=False,
@@ -506,6 +575,15 @@ def _poll_object_info(port: int, timeout: int, needle: str):
     return False
 
 
+def _port_ready(port: int, timeout: float = 3.0) -> bool:
+    """已运行守护（v2.3.8，§8 P8）：探测 8188 是否已有就绪实例。只读，无副作用。"""
+    try:
+        with urllib.request.urlopen(f"http://127.0.0.1:{port}/object_info", timeout=timeout) as r:
+            return r.status == 200
+    except Exception:  # noqa: BLE001
+        return False
+
+
 def phase7_verify(ctx: Ctx):
     log = ctx.logger
     log.info("P7", "start", "验收")
@@ -524,14 +602,24 @@ def phase7_verify(ctx: Ctx):
     # MiniMax-H3 加载器依赖 ComfyUI 原生支持（Comfy-Org/MiniMax-H3 官方 comfyui 模型，
     # PR#15224 已合并）；该仓库不在 custom_nodes 下独立存放，P7 仅报告，不强阻断。
     log.ok("P7", "node", "加载器依赖 ComfyUI 原生 MiniMax-H3 支持（native）")
-    # 3) torch.cuda + triton
-    r = _run_venv(ctx.venv_python,
-                  "import torch, triton; assert torch.cuda.is_available(); "
-                  "print(torch.cuda.get_device_capability())", timeout=120)
-    if r.returncode == 0:
-        log.ok("P7", "torch", "torch.cuda + triton 可用", detail=r.stdout.strip())
+    # 3) torch.cuda + triton（v2.3.8：venv 缺失守卫——--only p7 未先跑 P2 的场景，
+    #    此前 _run_venv 抛 FileNotFoundError 裸崩；缺失时降级为 WARN 跳过）
+    if ctx.venv_python and os.path.exists(ctx.venv_python):
+        r = _run_venv(ctx.venv_python,
+                      "import torch, triton; assert torch.cuda.is_available(); "
+                      "print(torch.cuda.get_device_capability())", timeout=120)
+        if r.returncode == 0:
+            log.ok("P7", "torch", "torch.cuda + triton 可用", detail=r.stdout.strip())
+        else:
+            # v2.3.10：区分"无 CUDA"与"triton 不可用"，避免无 GPU 安装时误报 triton
+            rc = _run_venv(ctx.venv_python, "import torch; print(torch.cuda.is_available())",
+                          timeout=60)
+            if rc.returncode == 0 and rc.stdout.strip().lower() == "false":
+                log.warn("P7", "torch", "torch.cuda 不可用（当前环境无 GPU，运行时需 NVIDIA GPU）")
+            else:
+                log.warn("P7", "torch", "triton 不可用", detail=r.stderr[-200:])
     else:
-        log.warn("P7", "torch", "triton 不可用", detail=r.stderr[-200:])
+        log.warn("P7", "torch", "venv 缺失（如 --only p7 未先执行 P2），跳过 torch/triton 检查")
     # 4) profile 资产全绿
     missing = [aid for aid in ctx.profile.get("asset_ids", [])
                if aid not in ctx.state.data.get("assets", {})
@@ -548,13 +636,17 @@ def phase7_verify(ctx: Ctx):
 
 def _smoke(ctx: Ctx):
     log = ctx.logger
+    # 已运行守护（v2.3.8）：已有就绪实例时直接通过，避免误拉起第二实例
+    if _port_ready(8188):
+        log.ok("P7", "smoke", "ComfyUI 已在运行，smoke 视为通过（未重复拉起）")
+        return
     log.info("P7", "smoke", "无头启动 ComfyUI 探测 /object_info（首跑豁免全模型加载）")
     port = 8188
     cmd = [ctx.venv_python, os.path.join(ctx.comfyui_dir, "main.py"),
            "--listen", "127.0.0.1", "--port", str(port)]
     logf = os.path.join(ctx.root, "run", "comfyui.log")
     os.makedirs(os.path.dirname(logf), exist_ok=True)
-    proc = subprocess.Popen(cmd, stdout=open(logf, "w"), stderr=subprocess.STDOUT)
+    proc = subprocess.Popen(cmd, stdout=open(logf, "a"), stderr=subprocess.STDOUT)
     try:
         ok = _poll_object_info(port, 600, "VedaSparseAttention")
         if ok:
@@ -579,37 +671,51 @@ def _write_run_scripts(ctx: Ctx):
     listen = "0.0.0.0" if ctx.args.listen else "127.0.0.1"
     main_py = os.path.join(ctx.comfyui_dir, "main.py")
     logf = os.path.join(run_dir, "comfyui.log")
+    pidf = os.path.join(run_dir, "comfyui.pid")
 
     if is_nt:
+        # start.bat：已运行守护（v2.3.8）+ 新窗口启动；stop.bat：PowerShell 按
+        # CommandLine 匹配 main.py 精确停止（旧 taskkill /FI WINDOWTITLE 匹配不到
+        # 无窗口的 python.exe，实测不可靠）。
         start = (
             "@echo off\r\n"
+            "curl -s --max-time 3 http://127.0.0.1:8188/object_info >nul 2>&1 && "
+            "(echo ComfyUI already running at http://127.0.0.1:8188 & exit /b 0)\r\n"
             f"cd /d \"{ctx.comfyui_dir}\"\r\n"
             f"start \"ComfyUI\" \"{ctx.venv_python}\" \"{main_py}\" --listen {listen} --port 8188\r\n"
+            "echo ComfyUI starting... log: run\\comfyui.log\r\n"
         )
         stop = (
             "@echo off\r\n"
-            "taskkill /IM python.exe /FI \"WINDOWTITLE eq ComfyUI*\" /F\r\n"
+            "powershell -NoProfile -Command \"Get-CimInstance Win32_Process -Filter "
+            "\\\"Name='python.exe'\\\" | Where-Object { $_.CommandLine -match 'main\\.py' } | "
+            "ForEach-Object { Stop-Process -Id $_.ProcessId -Force; Write-Output ('stopped pid ' + $_.ProcessId) }\"\r\n"
+            "if %errorlevel% neq 0 echo no ComfyUI process found\r\n"
         )
         status = (
             "@echo off\r\n"
-            "curl -s http://127.0.0.1:8188/ || echo ComfyUI not running\r\n"
+            "curl -s --max-time 3 http://127.0.0.1:8188/object_info >/dev/null 2>&1 && echo UP || echo DOWN\r\n"
         )
     else:
         start = (
             "#!/usr/bin/env bash\n"
+            "# 已运行守护（v2.3.8）：UP 即退出，避免二次拉起/端口冲突\n"
+            "curl -s --max-time 3 http://127.0.0.1:8188/object_info >/dev/null 2>&1 && "
+            "{ echo \"ComfyUI already running (http://127.0.0.1:8188)\"; exit 0; }\n"
             f"cd \"{ctx.comfyui_dir}\"\n"
             f"nohup \"{ctx.venv_python}\" \"{main_py}\" --listen {listen} --port 8188 "
-            f"> \"{logf}\" 2>&1 &\n"
-            "echo $! > \"" + os.path.join(run_dir, "comfyui.pid") + "\"\n"
+            f">> \"{logf}\" 2>&1 &\n"
+            "echo $! > \"" + pidf + "\"\n"
+            "echo \"ComfyUI starting (pid $(cat \"" + pidf + "\"))... log: " + logf + "\n"
         )
         stop = (
             "#!/usr/bin/env bash\n"
-            "PID=$(cat \"" + os.path.join(run_dir, "comfyui.pid") + "\" 2>/dev/null)\n"
+            "PID=$(cat \"" + pidf + "\" 2>/dev/null)\n"
             "kill $PID 2>/dev/null && echo stopped || echo not-running\n"
         )
         status = (
             "#!/usr/bin/env bash\n"
-            "curl -s http://127.0.0.1:8188/object_info >/dev/null && echo UP || echo DOWN\n"
+            "curl -s --max-time 3 http://127.0.0.1:8188/object_info >/dev/null && echo UP || echo DOWN\n"
         )
     with open(os.path.join(run_dir, "start.bat" if is_nt else "start.sh"), "w", newline="" if is_nt else None) as f:
         f.write(start)
@@ -625,6 +731,11 @@ def phase8_launch(ctx: Ctx):
     if ctx.args.no_launch:
         log.info("P8", "skip", "按 --no-launch 不启动")
         return
+    # 已运行守护（v2.3.8，§8 P8）：8188 已有就绪实例则跳过，避免二次拉起
+    # （端口冲突；且旧实例会响应就绪探测，掩盖新实例启动失败）
+    if _port_ready(8188):
+        log.ok("P8", "skip", "ComfyUI 已在运行（http://127.0.0.1:8188），跳过启动")
+        return
     log.info("P8", "start", "后台启动 ComfyUI")
     listen = "0.0.0.0" if ctx.args.listen else "127.0.0.1"
     cmd = [ctx.venv_python, os.path.join(ctx.comfyui_dir, "main.py"),
@@ -632,9 +743,15 @@ def phase8_launch(ctx: Ctx):
     logf = os.path.join(ctx.root, "run", "comfyui.log")
     os.makedirs(os.path.dirname(logf), exist_ok=True)
     if os.name == "nt":
-        subprocess.Popen(cmd, creationflags=0x00000008)  # DETACHED_PROCESS
+        # DETACHED_PROCESS + stdout/stderr 重定向到日志（v2.3.8：无控制台时
+        # 直接 print 可能异常）
+        subprocess.Popen(cmd, creationflags=0x00000008,  # DETACHED_PROCESS
+                         stdout=open(logf, "a"), stderr=subprocess.STDOUT)
     else:
-        subprocess.Popen(cmd, stdout=open(logf, "w"), stderr=subprocess.STDOUT)
+        # start_new_session=True（v2.3.8）：脱离控制组，终端会话关闭/SIGHUP
+        # 不再杀死 ComfyUI（等价 nohup）；日志追加不截断（保留历史便于排错）
+        subprocess.Popen(cmd, stdout=open(logf, "a"), stderr=subprocess.STDOUT,
+                         start_new_session=True)
     # 就绪探测
     if _poll_object_info(8188, 120, "VedaSparseAttention"):
         log.ok("P8", "ready", "ComfyUI 就绪", detail="http://127.0.0.1:8188")
