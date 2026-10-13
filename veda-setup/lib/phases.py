@@ -60,6 +60,32 @@ def _run_venv(venv_python: str, code: str, timeout: int = 120, capture=True):
                           text=True, timeout=timeout)
 
 
+def _torch_compat_ok(venv_python: str) -> "tuple[bool, str]":
+    """v2.3.13：检查 venv 内 torch 是否满足 ComfyUI/Veda 运行时依赖。
+
+    comfy_kitchen（被 ComfyUI 的 comfy/quant_ops.py 引入）需要
+    ``torch.library.custom_op``，该 API 自 **torch>=2.0** 才有。魔搭环境 venv 复用镜像
+    torch（system_site_packages），若镜像 torch < 2.0，启动即 AttributeError。此处提前
+    探测，给出清晰报错而非等待 launch 崩溃后再 dump 原始 traceback。
+
+    返回 (ok, detail)：ok=False 时 detail 为可操作的中文说明。
+    """
+    r = _run_venv(venv_python,
+                  "import torch; print(torch.__version__); "
+                  "print('custom_op' if hasattr(torch.library, 'custom_op') else 'no_custom_op')",
+                  timeout=120)
+    if r.returncode != 0:
+        return False, f"torch 无法导入：{(r.stderr or '')[-300:]}"
+    lines = [l.strip() for l in r.stdout.splitlines() if l.strip()]
+    ver = lines[0] if lines else "?"
+    has_cop = any(l == "custom_op" for l in lines)
+    if not has_cop:
+        return False, (f"torch 版本过低（{ver}），缺少 torch.library.custom_op"
+                       f"（comfy_kitchen 依赖，需 torch>=2.0）；"
+                       f"魔搭环境请选用 torch>=2.0 的 GPU 镜像，或升级镜像内 torch")
+    return True, ver
+
+
 def _comfyui_version(d: str):
     try:
         r = subprocess.run(["git", "-C", d, "describe", "--tags", "--abbrev=0"],
@@ -174,6 +200,12 @@ def preflight_launch(ctx: Ctx):
             log.info("LP", "gpu", "torch.cuda 可用", detail=r.stdout.strip())
     except Exception as e:  # noqa: BLE001
         log.warn("LP", "gpu", "CUDA 探测异常，跳过", detail=str(e)[:200])
+    # v2.3.13：torch API 兼容性早期信号（comfy_kitchen 需 torch.library.custom_op / torch>=2.0）。
+    # launch 路径若 torch 不兼容则无法启动，直接抛 E701 给出清晰原因，而非等待崩溃后 dump traceback。
+    compat_ok, compat_detail = _torch_compat_ok(vpy)
+    if not compat_ok:
+        raise PhaseError(701, f"torch 运行时不兼容，无法启动 ComfyUI：{compat_detail}")
+    log.info("LP", "torch", "torch API 兼容性 OK", detail=compat_detail)
     log.ok("LP", "done", "轻量预检通过（venv 可用、ComfyUI 就位）", detail=vpy)
 
 
@@ -646,6 +678,14 @@ def phase7_verify(ctx: Ctx):
                 log.warn("P7", "torch", "torch.cuda 不可用（当前环境无 GPU，运行时需 NVIDIA GPU）")
             else:
                 log.warn("P7", "torch", "triton 不可用", detail=r.stderr[-200:])
+        # v2.3.13：torch API 兼容性（comfy_kitchen 需 torch.library.custom_op / torch>=2.0）。
+        # 魔搭 venv 复用镜像 torch，若镜像 torch < 2.0 则 ComfyUI 启动即崩；此处明确预警。
+        compat_ok, compat_detail = _torch_compat_ok(ctx.venv_python)
+        if not compat_ok:
+            log.warn("P7", "torch", "torch 运行时不兼容，ComfyUI 启动将失败",
+                     detail=compat_detail)
+        else:
+            log.ok("P7", "torch", "torch API 兼容性 OK", detail=compat_detail)
     else:
         log.warn("P7", "torch", "venv 缺失（如 --only p7 未先执行 P2），跳过 torch/triton 检查")
     # 4) profile 资产全绿

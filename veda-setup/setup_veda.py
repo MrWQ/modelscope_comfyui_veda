@@ -3,7 +3,7 @@
 """Veda-on-ComfyUI 一键搭建 · 主驱动（跨平台，仅标准库）。
 
 人工唯一入口：python setup_veda.py （或经 install.sh / install.bat）。
-设计文档：docs/Veda一键脚本设计文档.md（v2.3.12）。
+设计文档：docs/Veda一键脚本设计文档.md（v2.3.13）。
 
 运行模式（M0，默认 auto）：自动判定是否已安装——
 已安装实例仅启动（跳过 P1–P7 安装段）；未安装则安装+启动。

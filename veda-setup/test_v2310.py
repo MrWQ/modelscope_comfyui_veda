@@ -565,6 +565,32 @@ def test_final_summary_states():
 
 
 # ---------------------------------------------------------------------------
+# v2.3.13：torch API 兼容性探针（comfy_kitchen 需 torch.library.custom_op / torch>=2.0）
+def test_torch_compat():
+    import subprocess as _sp
+
+    def fake_run(stdout, returncode=0, stderr=""):
+        return _sp.CompletedProcess(args=[], returncode=returncode,
+                                    stdout=stdout, stderr=stderr)
+
+    with mock.patch.object(phases, "_run_venv",
+                           return_value=fake_run("2.1.0\ncustom_op\n")):
+        ok, detail = phases._torch_compat_ok("fakepython")
+        check("torch_compat_ok", ok is True and detail == "2.1.0")
+
+    with mock.patch.object(phases, "_run_venv",
+                           return_value=fake_run("1.13.1\nno_custom_op\n")):
+        ok, detail = phases._torch_compat_ok("fakepython")
+        check("torch_compat_too_old", ok is False and "torch>=2.0" in detail)
+
+    with mock.patch.object(phases, "_run_venv",
+                           return_value=fake_run("", returncode=1,
+                                                stderr="ImportError: no torch")):
+        ok, detail = phases._torch_compat_ok("fakepython")
+        check("torch_compat_import_fail", ok is False and "torch 无法导入" in detail)
+
+
+# ---------------------------------------------------------------------------
 def main():
     test_confirm_branches()
     test_e103_no_gpu()
@@ -573,6 +599,7 @@ def main():
     test_compute_cap_ok()
     test_file_tree()
     test_p8_launch()
+    test_torch_compat()
     test_safetensors_integrity()
     test_download_recover_and_cleanup()
     test_final_summary_states()
