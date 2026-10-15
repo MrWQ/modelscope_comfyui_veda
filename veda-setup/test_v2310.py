@@ -1,4 +1,4 @@
-"""test_v2310.py — v2.3.10 自检集成测试。
+"""test_v2310.py — veda-setup 自检集成测试（覆盖 v2.3.10 → v2.3.14）。
 
 覆盖：
   · _confirm_continue 的 6 个分支（dry_run / --yes / TTY-y / TTY-n / TTY-EOF / 非交互）
@@ -189,6 +189,7 @@ def test_p8_launch():
     c = make_p8_ctx()
     with mock.patch.object(P, "_poll_object_info", return_value=True), \
          mock.patch.object(P, "_port_ready", return_value=False), \
+         mock.patch.object(P, "_launch_precheck", return_value=(True, "")), \
          mock.patch.object(P, "subprocess") as msp:
         msp.Popen.return_value = FakeProc(None)
         phases.phase8_launch(c)
@@ -199,6 +200,7 @@ def test_p8_launch():
     c = make_p8_ctx()
     with mock.patch.object(P, "_poll_object_info", return_value=False), \
          mock.patch.object(P, "_port_ready", return_value=False), \
+         mock.patch.object(P, "_launch_precheck", return_value=(True, "")), \
          mock.patch.object(P, "subprocess") as msp:
         msp.Popen.return_value = FakeProc(1)
         try:
@@ -212,6 +214,7 @@ def test_p8_launch():
     c = make_p8_ctx()
     with mock.patch.object(P, "_poll_object_info", return_value=False), \
          mock.patch.object(P, "_port_ready", return_value=False), \
+         mock.patch.object(P, "_launch_precheck", return_value=(True, "")), \
          mock.patch.object(P, "subprocess") as msp:
         msp.Popen.return_value = FakeProc(None)
         phases.phase8_launch(c)
@@ -224,6 +227,84 @@ def test_p8_launch():
     phases.final_summary(c, "launch-only")
     check("final_summary_notready_ok", True)
     cleanup(c)
+
+
+# ---------------------------------------------------------------------------
+# 11) v2.3.14：P8 启动前置硬门禁（环境不满足不 spawn 必崩进程）
+# ---------------------------------------------------------------------------
+def test_p8_launch_gate():
+    print("\n[11] phase8_launch 启动前置门禁（v2.3.14）")
+    import lib.phases as P
+    import subprocess as _sp
+
+    # 环境不满足 + strict=True（--mode launch / --only p8）：直接抛 E701，绝不 spawn
+    c = make_p8_ctx()
+    with mock.patch.object(P, "_launch_precheck", return_value=(False, "未检测到 NVIDIA GPU，Veda 需 GPU 才能运行")), \
+         mock.patch.object(P, "subprocess") as msp:
+        try:
+            phases.phase8_launch(c, strict=True)
+            check("p8_gate_strict_raises", False)
+        except phases.PhaseError as e:
+            check("p8_gate_strict_raises", e.code == 701)
+    check("p8_gate_strict_no_spawn", msp.Popen.call_count == 0)
+
+    # 环境不满足 + strict=False（auto/install 顺带启动）：跳过，不崩溃，不 spawn
+    c = make_p8_ctx()
+    with mock.patch.object(P, "_launch_precheck", return_value=(False, "torch 运行时不兼容：torch 版本过低")), \
+         mock.patch.object(P, "subprocess") as msp:
+        phases.phase8_launch(c, strict=False)
+    check("p8_gate_besteffort_skip", c.launch_ready is None
+          and c.launch_skipped_reason is not None)
+    check("p8_gate_besteffort_no_spawn", msp.Popen.call_count == 0)
+    check("p8_gate_besteffort_reason", "torch" in (c.launch_skipped_reason or ""))
+
+    # 环境满足：正常 spawn（Popen 被调用）
+    c = make_p8_ctx()
+    with mock.patch.object(P, "_launch_precheck", return_value=(True, "")), \
+         mock.patch.object(P, "_poll_object_info", return_value=True), \
+         mock.patch.object(P, "_port_ready", return_value=False), \
+         mock.patch.object(P, "subprocess") as msp:
+        msp.Popen.return_value = FakeProc(None)
+        phases.phase8_launch(c, strict=False)
+    check("p8_gate_ok_spawn", msp.Popen.call_count == 1 and c.launch_ready is True)
+
+
+# ---------------------------------------------------------------------------
+# 12) v2.3.14：_launch_precheck 四种环境判定
+# ---------------------------------------------------------------------------
+def test_launch_precheck():
+    print("\n[12] _launch_precheck 环境判定（v2.3.14）")
+    import subprocess as _sp
+
+    def fake_run(stdout, returncode=0, stderr=""):
+        return _sp.CompletedProcess(args=[], returncode=returncode,
+                                    stdout=stdout, stderr=stderr)
+
+    c = make_p8_ctx()
+
+    # venv 缺失
+    c.venv_python = os.path.join(c.root, "no_such_venv", "python")
+    ok, reason = phases._launch_precheck(c)
+    check("precheck_venv_missing", ok is False and "venv" in reason)
+
+    # venv 存在 + torch 不兼容（缺 custom_op）
+    c.venv_python = sys.executable
+    with mock.patch.object(phases, "_torch_compat_ok", return_value=(False, "torch too old: missing custom_op")), \
+         mock.patch.object(phases, "_run_venv", return_value=fake_run("nocuda")):
+        ok, reason = phases._launch_precheck(c)
+    check("precheck_torch_incompat", ok is False and "torch" in reason)
+
+    # venv 存在 + torch OK 但无 GPU
+    with mock.patch.object(phases, "_torch_compat_ok", return_value=(True, "2.1.0")), \
+         mock.patch.object(phases, "_run_venv", return_value=fake_run("nocuda")):
+        ok, reason = phases._launch_precheck(c)
+    check("precheck_no_gpu", ok is False and "GPU" in reason)
+
+    # venv 存在 + torch OK + 有 GPU
+    with mock.patch.object(phases, "_torch_compat_ok", return_value=(True, "2.1.0")), \
+         mock.patch.object(phases, "_run_venv", return_value=fake_run("cuda")):
+        ok, reason = phases._launch_precheck(c)
+    check("precheck_ok", ok is True and reason == "")
 
 
 PASS = []
@@ -563,6 +644,16 @@ def test_final_summary_states():
     warn_events = [e for e in cl.events if e[0] == "warn"]
     check("fs_false_warn", len(warn_events) >= 1)
 
+    # v2.3.14：环境不满足跳过启动（launch_skipped_reason 已设置）→ warn + 原因，不谎报可访问
+    c = make_p8_ctx(); c.launch_ready = None
+    c.launch_skipped_reason = "未检测到 NVIDIA GPU，Veda 需 GPU 才能运行"
+    cl = CapL(); c.logger = cl
+    phases.final_summary(c, "install：安装+启动")
+    warn_events = [e for e in cl.events if e[0] == "warn"]
+    has_access = any(isinstance(e[1].get("detail"), dict) and "access" in e[1]["detail"]
+                     for e in warn_events)
+    check("fs_skip_warn", len(warn_events) >= 1 and has_access is False)
+
 
 # ---------------------------------------------------------------------------
 # v2.3.13：torch API 兼容性探针（comfy_kitchen 需 torch.library.custom_op / torch>=2.0）
@@ -599,6 +690,8 @@ def main():
     test_compute_cap_ok()
     test_file_tree()
     test_p8_launch()
+    test_p8_launch_gate()
+    test_launch_precheck()
     test_torch_compat()
     test_safetensors_integrity()
     test_download_recover_and_cleanup()

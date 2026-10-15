@@ -50,6 +50,7 @@ class Ctx:
         self.plan = []
         self.user_aborted = False  # v2.3.9：无 GPU 经询问后用户选择不继续
         self.launch_ready = None  # v2.3.11：P8 就绪标记，供 final_summary 诚实汇报
+        self.launch_skipped_reason = None  # v2.3.14：P8 因环境不满足（无 GPU / torch 不兼容）跳过启动的原因
 
 
 # ---------------------------------------------------------------------------
@@ -71,7 +72,8 @@ def _torch_compat_ok(venv_python: str) -> "tuple[bool, str]":
     返回 (ok, detail)：ok=False 时 detail 为可操作的中文说明。
     """
     r = _run_venv(venv_python,
-                  "import torch; print(torch.__version__); "
+                  "import torch, sys; import torch.library; "
+                  "print(torch.__version__); "
                   "print('custom_op' if hasattr(torch.library, 'custom_op') else 'no_custom_op')",
                   timeout=120)
     if r.returncode != 0:
@@ -84,6 +86,33 @@ def _torch_compat_ok(venv_python: str) -> "tuple[bool, str]":
                        f"（comfy_kitchen 依赖，需 torch>=2.0）；"
                        f"魔搭环境请选用 torch>=2.0 的 GPU 镜像，或升级镜像内 torch")
     return True, ver
+
+
+def _launch_precheck(ctx: Ctx) -> "tuple[bool, str]":
+    """v2.3.14：启动前置硬门禁。
+
+    已探明的环境不满足（venv 缺失 / torch 不兼容 / 无 NVIDIA GPU）直接返回原因，
+    避免盲目 spawn 一个必崩的 ComfyUI 进程、等 120s 再 dump 原始 traceback。
+
+    Veda 运行时硬性依赖：torch>=2.0（comfy_kitchen 需 ``torch.library.custom_op``）
+    且必须有 NVIDIA GPU（CPU 模式不可用）。返回 (ok, reason)。
+    """
+    vpy = ctx.venv_python
+    if not (vpy and os.path.exists(vpy)):
+        return False, f"venv 缺失/失效（{vpy}），无法启动 ComfyUI"
+    # torch API 兼容性（comfy_kitchen 需 torch.library.custom_op / torch>=2.0）
+    compat_ok, compat_detail = _torch_compat_ok(vpy)
+    if not compat_ok:
+        return False, f"torch 运行时不兼容，无法启动 ComfyUI：{compat_detail}"
+    # CUDA 可用性（Veda 需 GPU 才能运行；CPU 模式不可用）
+    try:
+        r = _run_venv(vpy, "import torch; print('cuda' if torch.cuda.is_available() else 'nocuda')",
+                      timeout=60)
+    except Exception as e:  # noqa: BLE001
+        return False, f"torch 导入失败，无法确认 CUDA 可用性：{str(e)[:200]}"
+    if r.returncode != 0 or "nocuda" in r.stdout:
+        return False, "未检测到 NVIDIA GPU，Veda 需 GPU 才能运行（CPU 模式不可用），无法启动 ComfyUI"
+    return True, ""
 
 
 def _comfyui_version(d: str):
@@ -793,11 +822,31 @@ def _write_run_scripts(ctx: Ctx):
         f.write(status)
 
 
-def phase8_launch(ctx: Ctx):
+def phase8_launch(ctx: Ctx, strict: bool = True):
+    """后台启动 ComfyUI（§8 P8）。
+
+    strict=True（默认，用于 --mode launch / --only p8）：环境不满足运行条件时
+    直接抛 E701 并给出清晰原因（启动是该模式的目标，无法达成即失败）。
+    strict=False（用于 auto/install 安装段顺带启动）：环境不满足时**跳过启动**并诚实
+    汇报（安装本身已完成，不崩溃、不谎报），避免无 GPU / torch 不兼容容器陷入
+    "安装成功却必崩启动"的循环（v2.3.14）。
+    """
     log = ctx.logger
     _write_run_scripts(ctx)
     if ctx.args.no_launch:
         log.info("P8", "skip", "按 --no-launch 不启动")
+        return
+    # v2.3.14：启动前置硬门禁——已知环境的 torch 不兼容 / 无 GPU 直接给出清晰结果，
+    # 不再 spawn 必崩进程、等待 120s、再 dump traceback。
+    ok, reason = _launch_precheck(ctx)
+    if not ok:
+        if strict:
+            raise PhaseError(701, reason)
+        # 安装段顺带启动：环境不满足则跳过，诚实汇报，不把"安装成功"变成"启动失败"
+        log.warn("P8", "skip", "环境不满足运行条件，跳过启动（安装已完成）",
+                 detail=reason)
+        ctx.launch_skipped_reason = reason
+        ctx.launch_ready = None
         return
     # 已运行守护（v2.3.8，§8 P8）：8188 已有就绪实例则跳过，避免二次拉起
     # （端口冲突；且旧实例会响应就绪探测，掩盖新实例启动失败）
@@ -912,8 +961,22 @@ def final_summary(ctx: Ctx, mode_label: str):
         print("\n提示：ComfyUI 已在后台启动，但 120s 内尚未就绪，可能是大模型加载较慢。"
               "请用 run/status.sh 复查（UP 即代表可访问）；若长时间 DOWN，请查 run/comfyui.log。")
         return
-    # ready is None：本次根本未执行启动（--no-launch / 仅安装环节 / --mode launch --no-launch）
-    # v2.3.12：不得谎报「可访问」，改为提示用 run/start.sh 启动。
+    # ready is None：本次根本未执行启动（--no-launch / 仅安装环节 / --mode launch --no-launch
+    # / 或 v2.3.14 因环境不满足而跳过启动）
+    skip_reason = getattr(ctx, "launch_skipped_reason", None)
+    if skip_reason:
+        # 环境不满足运行条件（无 GPU / torch 不兼容）：明确告知，指引换镜像后启动，不谎报
+        ctx.logger.warn("ALL", "done",
+                        f"搭建流程完成（{mode_label}），但未启动 ComfyUI（环境不满足运行条件）",
+                        detail={
+            "profile": ctx.profile_name or ctx.state.data.get("install_profile"),
+            "root": ctx.root,
+            "skip_reason": skip_reason})
+        print(f"\n提示：安装已完成，但当前环境无法运行 ComfyUI：{skip_reason}。"
+              "请切换到「带 NVIDIA GPU 且 torch>=2.0」的镜像后，用 "
+              "bash run/start.sh（Windows 双击 run/start.bat）启动，"
+              "并用 run/status.sh 复查（UP 即代表可访问）。")
+        return
     ctx.logger.ok("ALL", "done", f"搭建流程完成（{mode_label}，未启动 ComfyUI）", detail={
         "profile": ctx.profile_name or ctx.state.data.get("install_profile"),
         "root": ctx.root,
