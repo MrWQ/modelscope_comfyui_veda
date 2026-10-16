@@ -188,8 +188,23 @@ def venv_python(root: str) -> str:
     return os.path.join(root, "venv", "bin", "python")
 
 
-def ensure_venv(root: str, system_site_packages: bool, logger=None) -> str:
-    """返回 venv 的 python 绝对路径；已存在且可用则复用，否则重建。"""
+def ensure_venv(root: str, system_site_packages: bool, logger=None, ctx=None) -> str:
+    """返回 venv 的 python 绝对路径；已存在且可用则复用，否则重建。
+
+    v2.3.15：venv 创建健壮性。`python3 -m venv` 在部分魔搭/自定义镜像上会因
+    ``ensurepip`` 不可用而退出码 1（典型：Debian/Ubuntu 缺 ``python3-venv``；或
+    自定义 Python 构建未捆绑 ensurepip 引导轮）。此前 ``subprocess.run(check=True)``
+    直接抛 ``CalledProcessError``，被顶层吞成无意义的 ``FATAL/unexpected``，且丢失
+    真实 stderr。现改为依次尝试、捕获真实报错并优雅回退：
+
+      1) ``python3 -m venv [--system-site-packages]``                    常规
+      2) ``python3 -m venv [--system-site-packages] --without-pip``      绕过 ensurepip 引导
+      3) 直接复用系统 Python（``sys.executable``）——本就 ``--system-site-packages``，
+         依赖由镜像预置，避免污染/破坏系统环境（如镜像自带的 ROCm torch）
+
+    任一成功即返回可用 python；全部失败也不抛错，最终回退到系统 Python 并置
+    ``ctx.venv_fallback=True``（供 P2 跳过 requirements 安装）。
+    """
     vpy = venv_python(root)
     if os.path.exists(vpy):
         try:
@@ -203,14 +218,48 @@ def ensure_venv(root: str, system_site_packages: bool, logger=None) -> str:
             pass
         if logger:
             logger.warn("P2", "venv", "venv 失效，重建", detail=vpy)
-    cmd = [sys.executable, "-m", "venv"]
-    if system_site_packages:
-        cmd.append("--system-site-packages")
-    cmd.append(os.path.join(root, "venv"))
+        shutil.rmtree(os.path.join(root, "venv"), ignore_errors=True)
+
+    venv_dir = os.path.join(root, "venv")
+    attempts = [
+        ([], "标准 venv（--system-site-packages）"),
+        (["--without-pip"], "venv --without-pip（绕过 ensurepip 引导）"),
+    ]
+    last_err = ""
+    for extra, label in attempts:
+        cmd = [sys.executable, "-m", "venv"]
+        if system_site_packages:
+            cmd.append("--system-site-packages")
+        cmd.extend(extra)
+        cmd.append(venv_dir)
+        if logger:
+            logger.info("P2", "venv", "创建 venv", detail=label)
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+        if r.returncode == 0 and os.path.exists(vpy):
+            chk = subprocess.run([vpy, "-c", "import sys; print(sys.version)"],
+                                 capture_output=True, text=True, timeout=30)
+            if chk.returncode == 0:
+                if logger:
+                    logger.ok("P2", "venv", "venv 创建成功", detail=label)
+                if ctx is not None:
+                    # --without-pip 视为 fallback：pip 经 --system-site-packages 落到系统，
+                    # P2 跳过 requirements 安装以免破坏系统环境
+                    ctx.venv_fallback = bool(extra)
+                return vpy
+            last_err = (chk.stderr or "").strip()
+        else:
+            last_err = (r.stderr or r.stdout or "").strip()
+        if logger:
+            logger.warn("P2", "venv", "venv 创建失败",
+                        detail={"label": label, "rc": r.returncode, "err": last_err[-300:]})
+
+    # 全部 venv 方式失败 → 回退到系统 Python（永不抛错，优雅降级）
     if logger:
-        logger.info("P2", "venv", "创建 venv", detail="system-site-packages=%s" % system_site_packages)
-    subprocess.run(cmd, check=True)
-    return vpy
+        logger.warn("P2", "venv", "venv 创建均失败（多为 ensurepip 不可用），回退到系统 Python 直接运行",
+                    detail={"sys_executable": sys.executable, "last_err": last_err[-300:]})
+    if ctx is not None:
+        ctx.venv_fallback = True
+    return sys.executable
 
 
 # ---------------------------------------------------------------------------

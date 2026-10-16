@@ -51,6 +51,7 @@ class Ctx:
         self.user_aborted = False  # v2.3.9：无 GPU 经询问后用户选择不继续
         self.launch_ready = None  # v2.3.11：P8 就绪标记，供 final_summary 诚实汇报
         self.launch_skipped_reason = None  # v2.3.14：P8 因环境不满足（无 GPU / torch 不兼容）跳过启动的原因
+        self.venv_fallback = False  # v2.3.15：venv 创建失败回退到系统 Python 时为 True（P2 跳过 requirements 安装以保护环境）
 
 
 # ---------------------------------------------------------------------------
@@ -104,13 +105,26 @@ def _launch_precheck(ctx: Ctx) -> "tuple[bool, str]":
     compat_ok, compat_detail = _torch_compat_ok(vpy)
     if not compat_ok:
         return False, f"torch 运行时不兼容，无法启动 ComfyUI：{compat_detail}"
-    # CUDA 可用性（Veda 需 GPU 才能运行；CPU 模式不可用）
+    # CUDA 可用性（Veda 需 NVIDIA GPU 才能运行；CPU 模式不可用）
+    # v2.3.15：同时识别非 CUDA 后端（如 AMD ROCm）——ROCm 下 torch.cuda.is_available()
+    # 亦为 True，但 torch.version.hip 存在且 torch.version.cuda 为空，Veda 依赖 NVIDIA
+    # 专属能力（如 nvfp4），不能在 ROCm 上运行，需诚实拦截而非盲启崩溃。
     try:
-        r = _run_venv(vpy, "import torch; print('cuda' if torch.cuda.is_available() else 'nocuda')",
+        r = _run_venv(vpy,
+                      "import torch; "
+                      "print('hip' if getattr(torch.version, 'hip', None) "
+                      "else ('cuda' if torch.cuda.is_available() else 'nocuda'))",
                       timeout=60)
     except Exception as e:  # noqa: BLE001
         return False, f"torch 导入失败，无法确认 CUDA 可用性：{str(e)[:200]}"
-    if r.returncode != 0 or "nocuda" in r.stdout:
+    if r.returncode != 0:
+        return False, f"torch 导入失败，无法确认 CUDA 可用性：{r.stderr.strip()[:200]}"
+    out = r.stdout.strip()
+    if out == "hip":
+        return False, ("检测到非 CUDA 后端（AMD ROCm：torch.version.hip 存在），"
+                      "Veda 依赖 NVIDIA CUDA（如 nvfp4），无法在此环境运行"
+                      "（请切换到 NVIDIA CUDA 镜像）")
+    if out == "nocuda":
         return False, "未检测到 NVIDIA GPU，Veda 需 GPU 才能运行（CPU 模式不可用），无法启动 ComfyUI"
     return True, ""
 
@@ -433,9 +447,15 @@ def phase1_comfyui(ctx: Ctx):
 # ---------------------------------------------------------------------------
 def phase2_deps(ctx: Ctx):
     log = ctx.logger
-    ctx.venv_python = platform.ensure_venv(ctx.root, ctx.system_site_packages, log)
+    ctx.venv_python = platform.ensure_venv(ctx.root, ctx.system_site_packages, log, ctx)
     req = os.path.join(ctx.comfyui_dir, "requirements.txt")
-    if os.path.exists(req):
+    # v2.3.15：venv 创建失败回退到系统 Python 时，跳过 requirements.txt 安装，
+    # 避免 pip 改写/破坏镜像预置的系统环境（如镜像自带的 ROCm torch）。
+    if ctx.venv_fallback:
+        if os.path.exists(req):
+            log.warn("P2", "pip", "venv 不可用（已回退系统 Python），跳过 requirements.txt 安装以保护环境",
+                     detail="依赖应已由镜像预置；如需强制安装请先修复 venv（apt install python3-venv）")
+    elif os.path.exists(req):
         env = os.environ.copy()
         env["PIP_CACHE_DIR"] = ctx.pip_cache
         try:
@@ -444,7 +464,7 @@ def phase2_deps(ctx: Ctx):
         except subprocess.CalledProcessError as e:
             log.warn("P2", "pip", "pip 安装失败，尝试重建 venv", detail=e.stderr[-300:])
             shutil.rmtree(os.path.join(ctx.root, "venv"), ignore_errors=True)
-            ctx.venv_python = platform.ensure_venv(ctx.root, ctx.system_site_packages, log)
+            ctx.venv_python = platform.ensure_venv(ctx.root, ctx.system_site_packages, log, ctx)
             try:
                 subprocess.run([ctx.venv_python, "-m", "pip", "install", "-r", req],
                                env=env, check=True, capture_output=True, text=True, timeout=1800)

@@ -1,0 +1,18 @@
+{"ts": "2026-10-16T09:14:55", "level": "INFO", "phase": "M0", "step": "mode", "event": "MODE_DECISION", "detail": {"decision": "install", "reason": "auto: is_installed=False", "forced": "auto", "is_installed": false}}
+{"ts": "2026-10-16T09:14:55", "level": "INFO", "phase": "P0", "step": "start", "event": "预检开始"}
+{"ts": "2026-10-16T09:14:55", "level": "INFO", "phase": "P0", "step": "env", "event": "平台识别", "detail": {"os": "Linux", "arch": "x86_64", "is_modelscope": true}}
+{"ts": "2026-10-16T09:14:55", "level": "WARN", "phase": "P0", "step": "gpu", "event": "未检测到 NVIDIA GPU（CPU 模式不可用）"}
+{"ts": "2026-10-16T09:14:57", "level": "INFO", "phase": "P0", "step": "confirm", "event": "用户确认继续", "detail": {"prompt": "未检测到 NVIDIA GPU（Veda 需 GPU 才能运行，CPU 模式不可用）。仍继续安装（将使用 standard 档）？"}}
+{"ts": "2026-10-16T09:14:57", "level": "WARN", "phase": "P0", "step": "profile", "event": "无 GPU 沿用 fallback 档", "detail": "standard"}
+{"ts": "2026-10-16T09:14:57", "level": "INFO", "phase": "P0", "step": "net", "event": "探测 modelscope", "detail": "https://modelscope.cn -> True"}
+{"ts": "2026-10-16T09:14:57", "level": "INFO", "phase": "P0", "step": "net", "event": "探测 hf-mirror", "detail": "https://hf-mirror.com -> True"}
+{"ts": "2026-10-16T09:15:02", "level": "INFO", "phase": "P0", "step": "net", "event": "探测 huggingface", "detail": "https://huggingface.co -> False"}
+{"ts": "2026-10-16T09:15:02", "level": "INFO", "phase": "P0", "step": "net", "event": "探测 github", "detail": "https://github.com -> True"}
+{"ts": "2026-10-16T09:15:02", "level": "INFO", "phase": "P0", "step": "net", "event": "探测 gh-proxy", "detail": "https://gh-proxy.com -> True"}
+{"ts": "2026-10-16T09:15:02", "level": "INFO", "phase": "P0", "step": "net", "event": "探测 gitclone", "detail": "https://gitclone.com -> True"}
+{"ts": "2026-10-16T09:15:02", "level": "INFO", "phase": "P0", "step": "net", "event": "源可用性表", "detail": {"modelscope": true, "hf-mirror": true, "huggingface": false, "github": true, "gh-proxy": true, "gitclone": true}}
+{"ts": "2026-10-16T09:15:02", "level": "INFO", "phase": "P0", "step": "state", "event": "沿用已有 state，幂等恢复"}
+{"ts": "2026-10-16T09:15:02", "level": "OK", "phase": "P0", "step": "done", "event": "预检完成", "detail": {"profile": "standard", "is_modelscope": true}}
+{"ts": "2026-10-16T09:15:02", "level": "OK", "phase": "P1", "step": "skip", "event": "ComfyUI 已对齐锁定 commit，跳过获取", "detail": "7f7fd918ed08"}
+{"ts": "2026-10-16T09:15:02", "level": "INFO", "phase": "P2", "step": "venv", "event": "创建 venv", "detail": "system-site-packages=True"}
+{"ts": "2026-10-16T09:15:02", "level": "ERROR", "phase": "FATAL", "step": "unexpected", "event": "Command '['/usr/bin/python3', '-m', 'venv', '--system-site-packages', '/mnt/workspace/comfyui-veda/venv']' returned non-zero exit status 1."}

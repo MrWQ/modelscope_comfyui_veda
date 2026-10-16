@@ -1,4 +1,4 @@
-"""test_v2310.py — veda-setup 自检集成测试（覆盖 v2.3.10 → v2.3.14）。
+"""test_v2310.py — veda-setup 自检集成测试（覆盖 v2.3.10 → v2.3.15）。
 
 覆盖：
   · _confirm_continue 的 6 个分支（dry_run / --yes / TTY-y / TTY-n / TTY-EOF / 非交互）
@@ -8,6 +8,9 @@
       E601 外来 ComfyUI（非交互中止 / --force / --yes / TTY-y）
   · platform.compute_cap_ok 边界（7.5 / 8.0 / 8.6 / None）
   · diag._file_tree 跨平台归一化（.git/.cache/venv 跳过不递归）
+  · v2.3.15：ensure_venv 健壮回退（复用/标准失败→--without-pip→系统 Python，置 venv_fallback）
+  · v2.3.15：phase2_deps 在 venv_fallback 时跳过 requirements 安装（保护系统环境）
+  · v2.3.15：_launch_precheck 识别非 CUDA 后端（AMD ROCm，torch.version.hip）
 
 直接 `python test_v2310.py` 运行（cwd=veda-setup）。无外部依赖，全 mock。
 """
@@ -305,6 +308,14 @@ def test_launch_precheck():
          mock.patch.object(phases, "_run_venv", return_value=fake_run("cuda")):
         ok, reason = phases._launch_precheck(c)
     check("precheck_ok", ok is True and reason == "")
+
+    # v2.3.15：非 CUDA 后端（AMD ROCm）——torch.version.hip 存在
+    c2 = make_p8_ctx()
+    with mock.patch.object(phases, "_torch_compat_ok", return_value=(True, "2.12.0")), \
+         mock.patch.object(phases, "_run_venv", return_value=fake_run("hip")):
+        ok, reason = phases._launch_precheck(c2)
+    check("precheck_rocm", ok is False and "ROCm" in reason)
+    cleanup(c2)
 
 
 PASS = []
@@ -682,6 +693,114 @@ def test_torch_compat():
 
 
 # ---------------------------------------------------------------------------
+# 13) v2.3.15：ensure_venv 健壮回退（复用 / 标准失败→--without-pip→系统 Python）
+# ---------------------------------------------------------------------------
+def test_ensure_venv_fallback():
+    print("\n[13] platform.ensure_venv 回退链（v2.3.15）")
+    import subprocess as _sp
+
+    def fake_run_factory(root, scenario):
+        def fake_run(cmd, *a, **k):
+            if "-m" in cmd and "venv" in cmd:
+                if scenario == "reuse":
+                    return _sp.CompletedProcess(cmd, 0, "", "")
+                if scenario == "without_pip_ok":
+                    if "--without-pip" in cmd:
+                        vpy = real_platform.venv_python(root)
+                        os.makedirs(os.path.dirname(vpy), exist_ok=True)
+                        open(vpy, "w").close()
+                        return _sp.CompletedProcess(cmd, 0, "", "")
+                    return _sp.CompletedProcess(cmd, 1, "", "ensurepip not available")
+                # all_fail：两种尝试都失败
+                return _sp.CompletedProcess(cmd, 1, "", "ensurepip not available")
+            if "-c" in cmd:
+                return _sp.CompletedProcess(cmd, 0, "3.12.0", "")
+            return _sp.CompletedProcess(cmd, 0, "", "")
+        return fake_run
+
+    # 场景 A：已有可用 venv → 复用，venv_fallback=False（不触发 venv 创建命令）
+    root_a = tempfile.mkdtemp(prefix="veda_vnv_a_")
+    c_a = phases.Ctx()
+    vpy_a = real_platform.venv_python(root_a)
+    os.makedirs(os.path.dirname(vpy_a), exist_ok=True)
+    open(vpy_a, "w").close()
+    rc0 = _sp.CompletedProcess(args=[], returncode=0, stdout="3.12.0", stderr="")
+    with mock.patch.object(real_platform.subprocess, "run") as mrun:
+        mrun.return_value = rc0
+        got = real_platform.ensure_venv(root_a, True, L(), c_a)
+    check("ensure_venv_reuse", got == vpy_a and c_a.venv_fallback is False)
+    venv_create_calls = [cl for cl in mrun.call_args_list
+                         if cl.args and "-m" in cl.args[0] and "venv" in cl.args[0]]
+    check("ensure_venv_reuse_no_create", len(venv_create_calls) == 0)
+    shutil.rmtree(root_a, ignore_errors=True)
+
+    # 场景 B：标准 venv 失败 → --without-pip 成功（仍视为 fallback）
+    root_b = tempfile.mkdtemp(prefix="veda_vnv_b_")
+    c_b = phases.Ctx()
+    with mock.patch.object(real_platform.subprocess, "run",
+                          side_effect=fake_run_factory(root_b, "without_pip_ok")):
+        got = real_platform.ensure_venv(root_b, True, L(), c_b)
+    check("ensure_venv_without_pip", got == real_platform.venv_python(root_b)
+          and c_b.venv_fallback is True)
+    shutil.rmtree(root_b, ignore_errors=True)
+
+    # 场景 C：全部失败 → 回退系统 Python，venv_fallback=True，不抛错
+    root_c = tempfile.mkdtemp(prefix="veda_vnv_c_")
+    c_c = phases.Ctx()
+    with mock.patch.object(real_platform.subprocess, "run",
+                          side_effect=fake_run_factory(root_c, "all_fail")):
+        got = real_platform.ensure_venv(root_c, True, L(), c_c)
+    check("ensure_venv_fallback_syspy", got == sys.executable
+          and c_c.venv_fallback is True)
+    shutil.rmtree(root_c, ignore_errors=True)
+
+
+# ---------------------------------------------------------------------------
+# 14) v2.3.15：phase2_deps 在 venv_fallback 时跳过 requirements 安装
+# ---------------------------------------------------------------------------
+def test_phase2_venv_fallback():
+    print("\n[14] phase2_deps venv 回退跳过 requirements（v2.3.15）")
+    import subprocess as _sp
+    import lib.phases as P
+
+    rc0 = _sp.CompletedProcess(args=[], returncode=0, stdout="", stderr="")
+
+    # 回退场景：ensure_venv 返回系统 python 且置 venv_fallback=True
+    c = make_p8_ctx()
+    os.makedirs(c.comfyui_dir, exist_ok=True)
+    with open(os.path.join(c.comfyui_dir, "requirements.txt"), "w") as f:
+        f.write("some-pkg\n")
+    with mock.patch.object(P.platform, "ensure_venv",
+                           side_effect=lambda *a, **k: (k.get("ctx") or a[3]).__setattr__("venv_fallback", True) or sys.executable), \
+         mock.patch.object(P, "subprocess") as msp:
+        msp.run.return_value = rc0
+        P.phase2_deps(c)
+    check("phase2_fallback_flag", c.venv_fallback is True)
+    check("phase2_fallback_py", c.venv_python == sys.executable)
+    pip_req = [cl for cl in msp.run.call_args_list
+               if cl.args and "pip" in cl.args[0] and "-r" in cl.args[0]]
+    check("phase2_fallback_skip_req", len(pip_req) == 0)
+    cleanup(c)
+
+    # 正常场景：venv 就绪 → 执行 pip install -r
+    c2 = make_p8_ctx()
+    os.makedirs(c2.comfyui_dir, exist_ok=True)
+    with open(os.path.join(c2.comfyui_dir, "requirements.txt"), "w") as f:
+        f.write("some-pkg\n")
+    vpy2 = (os.path.join(c2.root, "venv", "Scripts", "python.exe")
+            if os.name == "nt" else os.path.join(c2.root, "venv", "bin", "python"))
+    with mock.patch.object(P.platform, "ensure_venv", return_value=vpy2), \
+         mock.patch.object(P, "subprocess") as msp2:
+        msp2.run.return_value = rc0
+        P.phase2_deps(c2)
+    check("phase2_normal_no_fallback", c2.venv_fallback is False)
+    pip_req2 = [cl for cl in msp2.run.call_args_list
+                if cl.args and "pip" in cl.args[0] and "-r" in cl.args[0]]
+    check("phase2_normal_req_install", len(pip_req2) == 1)
+    cleanup(c2)
+
+
+# ---------------------------------------------------------------------------
 def main():
     test_confirm_branches()
     test_e103_no_gpu()
@@ -696,6 +815,8 @@ def main():
     test_safetensors_integrity()
     test_download_recover_and_cleanup()
     test_final_summary_states()
+    test_ensure_venv_fallback()
+    test_phase2_venv_fallback()
 
     print("\n" + "=" * 60)
     print(f"PASS={len(PASS)}  FAIL={len(FAIL)}")
