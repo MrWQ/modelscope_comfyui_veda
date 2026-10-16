@@ -28,6 +28,13 @@ sys.path.insert(0, HERE)
 
 from lib import phases, platform as real_platform, diag  # noqa: E402
 
+# 让自检在任何宿主 Python 上都能跑（目标运行环境为 3.10-3.12，脚本有 E101
+# 版本门禁；这里把 sys.version_info 钉到 3.12，避免开发机 3.13 误触发门禁）。
+from collections import namedtuple  # noqa: E402
+
+_VerInfo = namedtuple("version_info", "major minor micro releaselevel serial")  # noqa: E402
+sys.version_info = _VerInfo(3, 12, 0, "final", 0)  # noqa: E402
+
 
 # ---------------------------------------------------------------------------
 # 假 logger（含全部被调用方法）

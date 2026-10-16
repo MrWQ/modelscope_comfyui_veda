@@ -1,0 +1,23 @@
+# ---- Python ----
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# ---- 运行时 / 生成物（用户机器上由脚本产生，不应入库）----
+run/
+logs/
+ComfyUI/
+*.zip
+
+# ---- 内部工具目录 ----
+.workbuddy/
+
+# ---- 操作系统 ----
+.DS_Store
+Thumbs.db
+
+# ---- 编辑器 ----
+.idea/
+.vscode/

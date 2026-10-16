@@ -377,3 +377,38 @@ def disk_free(path: str) -> int:
         return shutil.disk_usage(path).free
     except Exception:  # noqa: BLE001
         return 0
+
+
+def detect_ram_gb() -> float:
+    """探测主机物理内存（GiB），失败返回 0.0（v2.3.19）。
+
+    Linux 读 /proc/meminfo（MemTotal）；Windows 走 GlobalMemoryStatusEx。
+    用于 NVIDIA Veda 容量门禁：DiT+TE 约 35GB 权重需常驻内存作 offload 缓冲，
+    内存不足会被宿主机 OOM-killer 静默杀掉整个 ComfyUI 进程。
+    """
+    try:
+        if os.name == "nt":
+            import ctypes
+            kernel32 = ctypes.windll.kernel32  # type: ignore
+            class MEMORYSTATUSEX(ctypes.Structure):
+                _fields_ = [("dwLength", ctypes.c_ulong),
+                            ("dwMemoryLoad", ctypes.c_ulong),
+                            ("ullTotalPhys", ctypes.c_ulonglong),
+                            ("ullAvailPhys", ctypes.c_ulonglong),
+                            ("ullTotalPageFile", ctypes.c_ulonglong),
+                            ("ullAvailPageFile", ctypes.c_ulonglong),
+                            ("ullTotalVirtual", ctypes.c_ulonglong),
+                            ("ullAvailVirtual", ctypes.c_ulonglong)]
+            ms = MEMORYSTATUSEX()
+            ms.dwLength = ctypes.sizeof(ms)
+            if kernel32.GlobalMemoryStatusEx(ctypes.byref(ms)):
+                return round(ms.ullTotalPhys / 1024 ** 3, 1)
+        else:
+            with open("/proc/meminfo", encoding="utf-8") as f:
+                for line in f:
+                    if line.startswith("MemTotal:"):
+                        kb = int(line.split()[1])
+                        return round(kb * 1024 / 1024 ** 3, 1)
+    except Exception:  # noqa: BLE001
+        return 0.0
+    return 0.0

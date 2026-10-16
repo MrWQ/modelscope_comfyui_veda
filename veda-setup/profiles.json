@@ -9,7 +9,7 @@
       "asset_ids": ["veda-predictor-t2va"]
     },
     "standard": {
-      "desc": "标准：int8 DiT(FL2VA+R2VA) + 32B nvfp4 编码器 + R2VA 全套（视频VAE int8/turbo4步/R2VA DiT），约 66GB 磁盘；档位由 P0 实测显存映射，磁盘不足自动降档",
+      "desc": "标准：int8 DiT(FL2VA+R2VA) + 32B nvfp4 编码器 + R2VA 全套（视频VAE int8/turbo4步/R2VA DiT），约 66GB 磁盘；档位由 P0 实测显存映射，磁盘不足自动降档。注意：NVIDIA 跑 Veda 需 ≥24GB 显存 + ≥48GB 内存（A10 24GB/28GB 实测首步推理被 OOM-killer 杀），不足时脚本 E104 拒绝并提示换 A100 80GB",
       "models": true,
       "vram_min_gb": 16,
       "asset_ids": ["veda-predictor-t2va", "veda-predictor-r2va", "h3-dit-int8", "h3-dit-int8-ref2va", "h3-te-nvfp4", "h3-vae-audio", "h3-vae-video", "h3-vae-video-int8", "h3-turbo-lora", "h3-ref2v-turbo-lora"]

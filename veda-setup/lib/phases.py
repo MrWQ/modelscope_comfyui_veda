@@ -221,6 +221,11 @@ def preflight_launch(ctx: Ctx):
         ctx.backend = "rocm"
     log.info("LP", "env", "轻量预检（launch 路径，只读，不跑磁盘/网络/降档）",
              detail=ctx.env)
+    # v2.3.19：launch-only 也提示 NVIDIA 容量风险（推理阶段可能 OOM，不会在启动时报错）
+    _ip = ctx.state.data.get("install_profile")
+    if _ip and getattr(ctx, "manifest_profiles", None) and _ip in ctx.manifest_profiles:
+        ctx.profile = ctx.manifest_profiles[_ip]
+        _nvidia_capacity_check(ctx, platform.detect_gpu(), strict=False)
     vpy = platform.venv_python(ctx.root)
     venv_ok = False
     if os.path.exists(vpy):
@@ -382,6 +387,8 @@ def phase0_preflight(ctx: Ctx):
     # lowvram 需第三方量化授权
     if ctx.profile.get("require_third_party") and not ctx.args.accept_third_party:
         raise PhaseError(403, "lowvram 档需第三方量化权重，请加 --accept-third-party")
+    # v2.3.19：NVIDIA 容量门禁（显存/内存不足直接拒绝，避免下载后必崩）
+    _nvidia_capacity_check(ctx, gpu, strict=True)
 
     # 网络探测
     ctx.network_table = platform.network_probe(platform.DEFAULT_HOSTS, log)
@@ -1007,6 +1014,41 @@ def _readiness_needle(ctx: Ctx) -> str:
     （MiniMaxH3ImageToVideo，ComfyUI 0.36.0+ 内置，文章 436864 证实无需额外节点包）。
     """
     return "MiniMaxH3ImageToVideo" if ctx.backend == "rocm" else "VedaSparseAttention"
+
+
+def _nvidia_capacity_check(ctx: Ctx, gpu: dict | None, strict: bool) -> None:
+    """v2.3.19：NVIDIA + 带模型档的容量门禁。
+
+    MiniMax-H3 Veda 的 int8_convrot DiT 约 20GB、32B 文本编码器约 15GB，T2V 推理
+    需 ~38GB 权重同时驻留（GPU+内存），且 20GB DiT 必须上 GPU 才能计算。实测
+    A10（22.7GB 显存 / 28GB 内存）在首步推理被宿主机 OOM-killer 静默杀掉整个
+    ComfyUI 进程（无 CUDA OOM 报错、卡在 Model Initializing、netstat 中 8188 消失）。
+
+    门槛（针对当前 manifest 的 NVIDIA 权重集）：VRAM >= 24GB 且 内存 >= 48GB。
+    - strict=True（安装路径 phase0）：不足直接抛 E104，避免下载 66GB 后必崩。
+    - strict=False（launch-only 路径）：仅告警，提示推理大概率会 OOM。
+    """
+    if ctx.backend != "nvidia":
+        return
+    if not getattr(ctx, "profile", None) or not ctx.profile.get("models"):
+        return
+    vram = gpu.get("vram_gb", 0.0) if gpu else 0.0
+    ram = platform.detect_ram_gb()
+    need_vram, need_ram = 24.0, 48.0
+    lacks = []
+    if vram < need_vram:
+        lacks.append(f"显存 {vram}GB < {need_vram:.0f}GB（DiT 权重约 20GB 必须上 GPU 计算）")
+    if ram < need_ram:
+        lacks.append(f"内存 {ram}GB < {need_ram:.0f}GB（DiT+TE 约 35GB 需常驻内存作 offload 缓冲）")
+    if not lacks:
+        return
+    msg = ("MiniMax-H3 Veda 模型需 ≥{nv:.0f}GB 显存且 ≥{nr:.0f}GB 内存，当前不满足："
+           + "；".join(lacks)
+           + "。请切换到 A100 80GB（或 ≥48GB 显存 + ≥64GB 内存）的实例后再运行，"
+             "当前实例推理阶段会被 OOM-killer 杀掉。").format(nv=need_vram, nr=need_ram)
+    if strict:
+        raise PhaseError(104, msg)
+    ctx.logger.warn("P0", "capacity", "NVIDIA 容量可能不足（推理大概率 OOM）", detail=msg)
 
 
 def _write_run_scripts(ctx: Ctx):
