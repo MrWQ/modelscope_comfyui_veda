@@ -1,0 +1,3 @@
+{"ts": "2026-10-16T13:45:52", "level": "INFO", "phase": "M0", "step": "mode", "event": "MODE_DECISION", "detail": {"decision": "install-partial", "reason": "--only p5", "forced": "auto", "is_installed": null}}
+{"ts": "2026-10-16T13:45:52", "level": "INFO", "phase": "P0", "step": "start", "event": "预检开始"}
+{"ts": "2026-10-16T13:45:52", "level": "ERROR", "phase": "FATAL", "step": "phase", "event": "Python 3.13 不在 3.10-3.12 范围", "error_code": 101}

@@ -1,6 +1,6 @@
 {
   "schema": "veda-assets/v1",
-  "note": "repo 类资产锁定 commit/tag 防上游破坏（见 §9.1）。comfyui/veda 已回填验证存在的真实 commit（2026-10）。MiniMax-H3 加载器走 ComfyUI 原生（Comfy-Org/MiniMax-H3 官方带 comfyui 标签），不单独 clone 第三方加载器节点（Comfy-Org/ComfyUI-MiniMaxH3 经核实不存在，404）。模型权重以文件名+min_bytes+头部校验保证；min_bytes 为真实文件大小的安全下界（已按魔搭官方清单校准，非估算）。",
+  "note": "repo 类资产锁定 commit/tag 防上游破坏（见 §9.1）。comfyui/veda 已回填验证存在的真实 commit（2026-10）。MiniMax-H3 加载器走 ComfyUI 原生（Comfy-Org/MiniMax-H3 官方带 comfyui 标签），不单独 clone 第三方加载器节点（Comfy-Org/ComfyUI-MiniMaxH3 经核实不存在，404）。模型权重以文件名+min_bytes+头部校验保证；min_bytes 为真实文件大小的安全下界（已按魔搭官方清单校准，非估算）。v2.3.17 增补 R2VA（参考图生视频）模板所需权重：视频 VAE int8_convrot、R2VA Turbo 4步 LoRA、R2VA DiT（ref2va int8_convrot），体积已回填魔搭实测真实值；并入 standard/full 档，P5 幂等下载 + safetensors 头部完整性校验（已存在且完整则跳过，不重复下载）。",
   "repos": [
     {
       "id": "comfyui",
@@ -95,6 +95,36 @@
       "sources": [
         {"type": "modelscope", "repo": "Comfy-Org/MiniMax-H3", "include": "loras/minimax_h3_fl2v_turbo_8step_v1.0_comfyui_bf16.safetensors"},
         {"type": "hf", "repo": "Comfy-Org/MiniMax-H3", "include": "loras/minimax_h3_fl2v_turbo_8step_v1.0_comfyui_bf16.safetensors", "endpoint": "https://hf-mirror.com"}
+      ]
+    },
+    {
+      "id": "h3-vae-video-int8",
+      "title": "MiniMax-H3 视频 VAE (int8_convrot, 2,811,065,184B 魔搭实测, R2VA 模板用)",
+      "target": "ComfyUI/models/vae/minimax_h3_video_vae_int8_convrot.safetensors",
+      "min_bytes": 2700000000,
+      "sources": [
+        {"type": "modelscope", "repo": "Comfy-Org/MiniMax-H3", "include": "vae/minimax_h3_video_vae_int8_convrot.safetensors"},
+        {"type": "hf", "repo": "Comfy-Org/MiniMax-H3", "include": "vae/minimax_h3_video_vae_int8_convrot.safetensors", "endpoint": "https://hf-mirror.com"}
+      ]
+    },
+    {
+      "id": "h3-ref2v-turbo-lora",
+      "title": "MiniMax-H3 R2VA Turbo 4步 LoRA (1,956,193,000B 魔搭实测)",
+      "target": "ComfyUI/models/loras/minimax_h3_ref2v_turbo_4step_v0.1_comfyui_bf16.safetensors",
+      "min_bytes": 1800000000,
+      "sources": [
+        {"type": "modelscope", "repo": "Comfy-Org/MiniMax-H3", "include": "loras/minimax_h3_ref2v_turbo_4step_v0.1_comfyui_bf16.safetensors"},
+        {"type": "hf", "repo": "Comfy-Org/MiniMax-H3", "include": "loras/minimax_h3_ref2v_turbo_4step_v0.1_comfyui_bf16.safetensors", "endpoint": "https://hf-mirror.com"}
+      ]
+    },
+    {
+      "id": "h3-dit-int8-ref2va",
+      "title": "MiniMax-H3 R2VA DiT (ref2va int8_convrot, 20,970,379,616B 魔搭实测, 与 FL2VA DiT 同体积不同权重)",
+      "target": "ComfyUI/models/diffusion_models/minimax_h3_ref2va_pruned_int8_convrot.safetensors",
+      "min_bytes": 20000000000,
+      "sources": [
+        {"type": "modelscope", "repo": "Comfy-Org/MiniMax-H3", "include": "diffusion_models/minimax_h3_ref2va_pruned_int8_convrot.safetensors"},
+        {"type": "hf", "repo": "Comfy-Org/MiniMax-H3", "include": "diffusion_models/minimax_h3_ref2va_pruned_int8_convrot.safetensors", "endpoint": "https://hf-mirror.com"}
       ]
     }
   ]
