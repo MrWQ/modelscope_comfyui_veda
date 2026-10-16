@@ -1,4 +1,4 @@
-"""test_v2310.py — veda-setup 自检集成测试（覆盖 v2.3.10 → v2.3.15）。
+"""test_v2310.py — veda-setup 自检集成测试（覆盖 v2.3.10 → v2.3.16）。
 
 覆盖：
   · _confirm_continue 的 6 个分支（dry_run / --yes / TTY-y / TTY-n / TTY-EOF / 非交互）
@@ -11,6 +11,7 @@
   · v2.3.15：ensure_venv 健壮回退（复用/标准失败→--without-pip→系统 Python，置 venv_fallback）
   · v2.3.15：phase2_deps 在 venv_fallback 时跳过 requirements 安装（保护系统环境）
   · v2.3.15：_launch_precheck 识别非 CUDA 后端（AMD ROCm，torch.version.hip）
+  · v2.3.16：pip 源可达性预检（可达/不可达）+ 流式安装（成功/无输出超时 kill）
 
 直接 `python test_v2310.py` 运行（cwd=veda-setup）。无外部依赖，全 mock。
 """
@@ -175,6 +176,7 @@ def make_p8_ctx():
     ctx.root = tempfile.mkdtemp(prefix="veda_p8_")
     ctx.comfyui_dir = os.path.join(ctx.root, "ComfyUI")
     ctx.venv_python = sys.executable  # 实际不执行（Popen 被 mock）
+    ctx.pip_cache = os.path.join(ctx.root, "pip_cache")  # 避免流式安装取 None
     ctx.manifest = {"assets": []}
     ctx.manifest_sha1 = "x"
     ctx.manifest_profiles = PROFILES
@@ -782,21 +784,95 @@ def test_phase2_venv_fallback():
     check("phase2_fallback_skip_req", len(pip_req) == 0)
     cleanup(c)
 
-    # 正常场景：venv 就绪 → 执行 pip install -r
+    # 正常场景：venv 就绪 → 预检通过 → 流式 pip install -r（经 Popen，非 subprocess.run）
     c2 = make_p8_ctx()
     os.makedirs(c2.comfyui_dir, exist_ok=True)
     with open(os.path.join(c2.comfyui_dir, "requirements.txt"), "w") as f:
         f.write("some-pkg\n")
     vpy2 = (os.path.join(c2.root, "venv", "Scripts", "python.exe")
             if os.name == "nt" else os.path.join(c2.root, "venv", "bin", "python"))
+
+    class _StreamProc:
+        def __init__(self):
+            self.stdout = iter(["Downloading some-pkg (10 kB)",
+                                "Installing some-pkg",
+                                "Successfully installed some-pkg"])
+        def wait(self, timeout=None):
+            return 0
+        def kill(self):
+            pass
+
     with mock.patch.object(P.platform, "ensure_venv", return_value=vpy2), \
+         mock.patch.object(P, "_pip_index_reachable", return_value=(True, "pypi.org")), \
          mock.patch.object(P, "subprocess") as msp2:
-        msp2.run.return_value = rc0
+        msp2.run.return_value = rc0  # 供 Windows triton 探测分支使用
+        msp2.Popen.return_value = _StreamProc()
         P.phase2_deps(c2)
     check("phase2_normal_no_fallback", c2.venv_fallback is False)
-    pip_req2 = [cl for cl in msp2.run.call_args_list
-                if cl.args and "pip" in cl.args[0] and "-r" in cl.args[0]]
-    check("phase2_normal_req_install", len(pip_req2) == 1)
+    pip_calls = [cl for cl in msp2.Popen.call_args_list
+                 if cl.args and isinstance(cl.args[0], list)
+                 and "pip" in cl.args[0] and "-r" in cl.args[0]]
+    check("phase2_normal_req_install", len(pip_calls) == 1)
+    cleanup(c2)
+
+
+# ---------------------------------------------------------------------------
+# 15) v2.3.16：pip 源可达性预检 + 流式安装（避免 P2 静默卡死）
+# ---------------------------------------------------------------------------
+def test_pip_streaming():
+    print("\n[15] pip 源预检 + 流式安装（v2.3.16）")
+    import lib.phases as P
+    import urllib.request as _ur
+
+    # _pip_index_reachable：索引可达
+    class _CtxOk:
+        status = 200
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+        def read(self, n=1): return b"x"
+    with mock.patch.object(_ur, "urlopen", return_value=_CtxOk()):
+        ok, msg = P._pip_index_reachable(L())
+    check("pip_reach_ok", ok is True and "pypi.org" in msg)
+
+    # _pip_index_reachable：索引不可达（urlopen 抛异常）
+    with mock.patch.object(_ur, "urlopen", side_effect=Exception("conn timeout")):
+        ok, msg = P._pip_index_reachable(L())
+    check("pip_reach_fail", ok is False and "不可达" in msg)
+
+    # _pip_install_streaming：成功（rc=0，逐行读取并收集 tail）
+    c = make_p8_ctx()
+    class _GoodProc:
+        def __init__(self):
+            self.stdout = iter(["Downloading torch (800 MB)",
+                                "Installing torch",
+                                "Successfully installed torch"])
+        def wait(self, timeout=None): return 0
+        def kill(self): pass
+    with mock.patch.object(P, "subprocess") as msp:
+        msp.Popen.return_value = _GoodProc()
+        rc, tail = P._pip_install_streaming(c, "req.txt", L())
+    check("pip_stream_rc0", rc == 0)
+    check("pip_stream_tail", "Successfully installed torch" in tail)
+    cleanup(c)
+
+    # _pip_install_streaming：无输出超时 → kill 并返回 rc=1（1s 窗口快速验证）
+    c2 = make_p8_ctx()
+    class _BlockIter:
+        def __iter__(self): return self
+        def __next__(self):
+            import time as _t
+            while True:
+                _t.sleep(0.3)  # 永不产出下一行，阻塞读取（模拟源黑洞）
+    class _BlockProc:
+        def __init__(self):
+            self.stdout = _BlockIter()
+        def wait(self, timeout=None): return 0
+        def kill(self): pass
+    with mock.patch.object(P, "subprocess") as msp2:
+        msp2.Popen.return_value = _BlockProc()
+        rc2, tail2 = P._pip_install_streaming(c2, "req.txt", L(),
+                                              overall_timeout=5, no_output_timeout=1)
+    check("pip_stream_noinput_kill", rc2 == 1)
     cleanup(c2)
 
 
@@ -817,6 +893,7 @@ def main():
     test_final_summary_states()
     test_ensure_venv_fallback()
     test_phase2_venv_fallback()
+    test_pip_streaming()
 
     print("\n" + "=" * 60)
     print(f"PASS={len(PASS)}  FAIL={len(FAIL)}")

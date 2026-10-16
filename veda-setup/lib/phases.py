@@ -12,6 +12,7 @@ import json
 import time
 import shutil
 import subprocess
+import threading
 import urllib.request
 
 try:
@@ -445,6 +446,90 @@ def phase1_comfyui(ctx: Ctx):
 # ---------------------------------------------------------------------------
 # P2 依赖 / venv
 # ---------------------------------------------------------------------------
+def _pip_index_reachable(logger=None) -> tuple:
+    """探测 pip 实际使用的索引是否可达，避免 install 在不可达源上静默卡 30 分钟。
+
+    探测顺序：PIP_INDEX_URL 环境变量 → 默认 pypi.org 简单索引。
+    任一可达即返回 (True, 说明)；全部不可达返回 (False, 说明)。
+    v2.3.16 新增（回应实测“P2 复用 venv 后长时间无日志”的静默卡死）。
+    """
+    candidates = []
+    env_idx = os.environ.get("PIP_INDEX_URL")
+    if env_idx:
+        candidates.append(("PIP_INDEX_URL", env_idx))
+    candidates.append(("pypi.org", "https://pypi.org/simple/"))
+    reachable, unreachable = [], []
+    for name, url in candidates:
+        base = url.split("?")[0].rstrip("/") + "/"
+        try:
+            req = urllib.request.Request(base, method="GET")
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                resp.read(1)  # 仅取首字节，避免下载整个索引体
+                if 200 <= resp.status < 400:
+                    reachable.append(name)
+                else:
+                    unreachable.append(f"{name}(HTTP {resp.status})")
+        except Exception as e:  # noqa: BLE001
+            unreachable.append(f"{name}({type(e).__name__}: {str(e)[:80]})")
+    if reachable:
+        return True, "pip 索引可达: " + ", ".join(reachable)
+    return False, "pip 索引均不可达: " + "; ".join(unreachable)
+
+
+def _pip_install_streaming(ctx, req, logger, overall_timeout=2400, no_output_timeout=1800):
+    """实时流式执行 pip install -r req，避免 30 分钟静默假死（v2.3.16）。
+
+    - 子进程 stdout/stderr 合并，逐行实时打印到控制台（前缀 [pip]），用户可见进度；
+    - 记录末尾若干行用于失败时报错；
+    - 双保险超时：整体超时 overall_timeout；无输出超时 no_output_timeout（疑似源卡死/黑洞）。
+    返回 (returncode, tail_text)。
+    """
+    env = os.environ.copy()
+    env["PIP_CACHE_DIR"] = ctx.pip_cache
+    cmd = [ctx.venv_python, "-m", "pip", "install", "-r", req, "--progress-bar", "off"]
+    logger.info("P2", "pip", "开始安装 ComfyUI 依赖（可能下载数 GB，进度实时输出如下）",
+                detail=" ".join(cmd))
+    proc = subprocess.Popen(cmd, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                            text=True, bufsize=1, encoding="utf-8", errors="replace")
+    tail = []
+    state = {"last": time.time(), "done": False}
+
+    def _reader():
+        try:
+            for raw in proc.stdout:
+                state["last"] = time.time()
+                line = raw.rstrip("\n")
+                print(f"  [pip] {line}", flush=True)
+                tail.append(line)
+                if len(tail) > 200:
+                    tail.pop(0)
+        except Exception:  # noqa: BLE001
+            pass
+        state["done"] = True
+
+    threading.Thread(target=_reader, daemon=True).start()
+    while not state["done"]:
+        if time.time() - state["last"] > no_output_timeout:
+            try:
+                proc.kill()
+            except Exception:  # noqa: BLE001
+                pass
+            logger.error("P2", "pip",
+                         "pip 超过 %ds 无任何输出，判定源卡死/不可达，已终止" % no_output_timeout)
+            return 1, "\n".join(tail[-80:])
+        time.sleep(5)
+    try:
+        rc = proc.wait(timeout=overall_timeout)
+    except subprocess.TimeoutExpired:
+        try:
+            proc.kill()
+        except Exception:  # noqa: BLE001
+            pass
+        logger.error("P2", "pip", "pip 安装整体超时（>%ds）" % overall_timeout)
+        return 1, "\n".join(tail[-80:])
+    return rc, "\n".join(tail)
+
+
 def phase2_deps(ctx: Ctx):
     log = ctx.logger
     ctx.venv_python = platform.ensure_venv(ctx.root, ctx.system_site_packages, log, ctx)
@@ -456,22 +541,24 @@ def phase2_deps(ctx: Ctx):
             log.warn("P2", "pip", "venv 不可用（已回退系统 Python），跳过 requirements.txt 安装以保护环境",
                      detail="依赖应已由镜像预置；如需强制安装请先修复 venv（apt install python3-venv）")
     elif os.path.exists(req):
-        env = os.environ.copy()
-        env["PIP_CACHE_DIR"] = ctx.pip_cache
-        try:
-            subprocess.run([ctx.venv_python, "-m", "pip", "install", "-r", req],
-                           env=env, check=True, capture_output=True, text=True, timeout=1800)
-        except subprocess.CalledProcessError as e:
-            log.warn("P2", "pip", "pip 安装失败，尝试重建 venv", detail=e.stderr[-300:])
+        # v2.3.16：先探测 pip 索引可达性，避免不可达时静默卡 30 分钟
+        ok, msg = _pip_index_reachable(log)
+        if not ok:
+            raise PhaseError(203,
+                             f"pip 源不可达，无法安装 ComfyUI 依赖：{msg}。"
+                             f"请检查网络或配置镜像源"
+                             f"（如 `pip config set global.index-url "
+                             f"https://mirrors.aliyun.com/pypi/simple/`）后重跑。")
+        log.info("P2", "pip", "pip 索引预检通过", detail=msg)
+        rc, tail = _pip_install_streaming(ctx, req, log)
+        if rc != 0:
+            log.warn("P2", "pip", "pip 安装失败，尝试重建 venv", detail=tail[-300:])
             shutil.rmtree(os.path.join(ctx.root, "venv"), ignore_errors=True)
             ctx.venv_python = platform.ensure_venv(ctx.root, ctx.system_site_packages, log, ctx)
-            try:
-                subprocess.run([ctx.venv_python, "-m", "pip", "install", "-r", req],
-                               env=env, check=True, capture_output=True, text=True, timeout=1800)
-            except subprocess.CalledProcessError as e2:
+            rc2, tail2 = _pip_install_streaming(ctx, req, log)
+            if rc2 != 0:
                 # v2.3.8：二次失败给出明确错误码（此前冒泡为"未预期错误"，无 E203）
-                raise PhaseError(203, f"ComfyUI 依赖安装失败（venv 重建后仍失败）："
-                                      f"{(e2.stderr or '')[-200:]}")
+                raise PhaseError(203, f"ComfyUI 依赖安装失败（venv 重建后仍失败）：{tail2[-200:]}")
             log.ok("P2", "venv", "venv 重建并重装完成（REBUILD_VENV）")
     # Windows triton 修复
     if os.name == "nt":
