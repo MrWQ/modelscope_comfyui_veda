@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import os
+import re
 import sys
 import json
 import time
@@ -47,21 +48,101 @@ def check_system_torch(logger=None) -> bool:
 # GPU 探测
 # ---------------------------------------------------------------------------
 def detect_gpu() -> dict | None:
-    if not shutil.which("nvidia-smi"):
-        return None
+    """探测 GPU。返回 {name, vendor, vram_gb, ...} 或 None。
+
+    vendor: "nvidia" | "amd"。v2.3.18：新增 AMD/ROCm 分支——魔搭 AMD 实例无
+    nvidia-smi，改走 ROCm 探测（系统 ROCm torch → rocm-smi → 设备 vendor 文件）。
+    """
+    # 1) NVIDIA（CUDA）
+    if shutil.which("nvidia-smi"):
+        try:
+            out = subprocess.run(
+                ["nvidia-smi", "--query-gpu=name,memory.total,compute_cap",
+                 "--format=csv,noheader"],
+                capture_output=True, text=True, timeout=30).stdout.strip()
+            if out:
+                line = out.splitlines()[0]
+                name, mem, cap = [x.strip() for x in line.split(",")]
+                vram_gb = float(mem.replace("MiB", "").replace("MB", "").strip()) / 1024.0
+                return {"name": name, "vendor": "nvidia",
+                        "vram_gb": round(vram_gb, 1), "compute_cap": cap}
+        except Exception:  # noqa: BLE001
+            pass
+    # 2) AMD / ROCm
+    amd = _detect_amd_gpu()
+    if amd:
+        return amd
+    return None
+
+
+def detect_gpu_backend() -> str:
+    """返回 'nvidia' | 'amd' | 'none'（v2.3.18）。"""
+    g = detect_gpu()
+    if not g:
+        return "none"
+    return g.get("vendor", "nvidia")
+
+
+def _detect_amd_gpu() -> dict | None:
+    """探测 AMD/ROCm GPU（v2.3.18）。返回 {name, vendor:'amd', vram_gb, arch} 或 None。
+
+    探测顺序（最可靠优先）：系统 Python 的 ROCm torch（魔搭镜像预装，可直接取
+    显存/架构）→ rocm-smi（型号/显存）→ /sys 设备 vendor 文件（0x1002=AMD）。
+    """
+    info: dict = {"vendor": "amd"}
+    # (1) 系统 ROCm torch：魔搭 AMD 镜像预装，最可靠地拿到显存与 gcnArchName
     try:
-        out = subprocess.run(
-            ["nvidia-smi", "--query-gpu=name,memory.total,compute_cap",
-             "--format=csv,noheader"],
-            capture_output=True, text=True, timeout=30).stdout.strip()
-        if not out:
-            return None
-        line = out.splitlines()[0]
-        name, mem, cap = [x.strip() for x in line.split(",")]
-        vram_gb = float(mem.replace("MiB", "").replace("MB", "").strip()) / 1024.0
-        return {"name": name, "vram_gb": round(vram_gb, 1), "compute_cap": cap}
+        r = subprocess.run([sys.executable, "-c",
+                            "import torch,json;"
+                            "print(json.dumps({"
+                            "'hip': getattr(torch.version,'hip',None),"
+                            "'avail': torch.cuda.is_available(),"
+                            "'name': (torch.cuda.get_device_name(0) if torch.cuda.is_available() else None),"
+                            "'mem': (torch.cuda.get_device_properties(0).total_memory if torch.cuda.is_available() else 0),"
+                            "'arch': (torch.cuda.get_device_properties(0).gcnArchName if torch.cuda.is_available() else None)"
+                            "}))"],
+                           capture_output=True, text=True, timeout=30)
+        if r.returncode == 0:
+            d = json.loads(r.stdout.strip().splitlines()[-1])
+            if d.get("hip") and d.get("avail"):
+                info["name"] = d.get("name") or "AMD GPU"
+                info["vram_gb"] = round((d.get("mem") or 0) / 1024 ** 3, 1)
+                info["arch"] = (d.get("arch") or "").strip()
+                return info
     except Exception:  # noqa: BLE001
-        return None
+        pass
+    # (2) rocm-smi 兜底（型号 / 显存 / gfx 架构）
+    if shutil.which("rocm-smi"):
+        try:
+            out = subprocess.run(["rocm-smi", "--showmeminfo", "vram"],
+                                 capture_output=True, text=True, timeout=30).stdout
+            m = re.search(r"VRAM Total Memory \(B\):\s*(\d+)", out)
+            if m:
+                info["vram_gb"] = round(int(m.group(1)) / 1024 ** 3, 1)
+            n = re.search(r"Name:\s*(AMD[^\n]*)", out)
+            if n:
+                info["name"] = n.group(1).strip()
+            out2 = subprocess.run(["rocminfo"], capture_output=True, text=True,
+                                  timeout=30).stdout
+            g = re.search(r"Name:\s*(gfx\d+)", out2)
+            if g:
+                info["arch"] = g.group(1)
+            info.setdefault("name", "AMD GPU")
+            return info
+        except Exception:  # noqa: BLE001
+            pass
+    # (3) 设备 vendor 文件兜底（0x1002 = AMD）
+    try:
+        for card in ("/sys/class/drm/card0/device/vendor",):
+            if os.path.exists(card):
+                with open(card, encoding="utf-8") as f:
+                    if f.read().strip() == "0x1002":
+                        info["name"] = "AMD GPU"
+                        info["arch"] = "gfx?"
+                        return info
+    except Exception:  # noqa: BLE001
+        pass
+    return None
 
 
 def compute_cap_ok(gpu: dict | None, min_cap: float = 8.0) -> bool:

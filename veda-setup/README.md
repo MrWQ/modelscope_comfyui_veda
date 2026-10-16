@@ -2,7 +2,7 @@
 
 在魔搭社区（ModelScope）免费 Notebook 等环境**一键部署 Veda-on-ComfyUI**（MiniMax-H3 视频扩散模型的官方加速节点，学习型稀疏注意力，约 3× 提速）。
 
-> 设计文档：`docs/Veda一键脚本设计文档.md`（v2.3.16）。本脚本严格按设计文档实现：多平台、持久化免重装、**安装/启动自动分流**、全自动、优先魔搭下载能力、结构化日志 + 诊断包；v2.3.7 含首次魔搭实例实测反馈修复（模型下载落点 / hf 兜底源链 / 阶段级快速跳过 / `--only` 单环节执行），v2.3.8 含全量自检修正（P8 已运行守护与会话脱离、tarball 幂等标记、通用源链 HF 直连兜底等），v2.3.9 含无 GPU 交互继续，v2.3.10 将同类"可询问跳过"扩展到 E102（算力不足）与 E601（外来 ComfyUI），并修正 `compute_cap_ok` 死代码、诊断包 Windows 分隔符等自检问题；v2.3.11 含 P8 启动诚实化修复（启动崩溃/超时不再谎报成功：崩溃抛 E701 + 就地打印 `run/comfyui.log` 尾部，超时诚实标记未就绪；launch 预检补 CUDA 可用性早期信号）；v2.3.12 含同类"谎报/不完整"缺陷修复（`final_summary` 三态——未启动不再谎报可访问 URL；`verify_safetensors_header` 数据段完整性防"下载不完整却判定成功"；`download_model_asset` 回收完整文件 + 清理半截 target；损坏 `.git` 自动重建）；v2.3.13 含 torch 运行时不兼容早暴露（launch 预检 torch<2.0 缺 `custom_op` 直接 E701 给清晰原因，install 验收同步 WARN）；v2.3.14 含启动前置硬门禁（`phase8_launch` 进入即综合判定 venv+torch+cuda，`strict=True` 环境不满足直接 E701 且不 spawn 必崩进程，`strict=False` 安装段顺带启动则跳过并诚实汇报，final_summary 据 `launch_skipped_reason` 明确"未启动（环境不满足）"并指引换 GPU 镜像）；v2.3.15 含 **P2 venv 创建健壮性 + 非 CUDA 后端（AMD ROCm）识别**（回应实测 `python3 -m venv` 因 ensurepip 不可用退出码 1 致 `FATAL/unexpected` 崩溃且丢失真实报错：`ensure_venv` 改为标准→`--without-pip`→回退系统 Python 三级尝试并捕获真实 stderr、永不抛错，回退时置 `ctx.venv_fallback` 且 P2 跳过 `requirements.txt` 安装以保护系统环境；`_launch_precheck` 新增 `torch.version.hip` 识别，ROCm 等"非 CUDA 后端"直接诚实跳过启动并提示换 NVIDIA CUDA 镜像）；v2.3.16 含 **P2 依赖安装静默卡死修复**（回应实测"复用 venv 后 `P2/venv 复用已有 venv` 之后长时间无任何日志"：`capture_output=True` 把 pip 输出全吞且超时 1800s，源慢/不可达时像死机；现新增 pip 源可达性预检——pypi.org 不可达则立即报 E203 并指引配置镜像源（如 `pip config set global.index-url https://mirrors.aliyun.com/pypi/simple/`），不再静默卡 30 分钟；并将 pip 安装改为实时流式输出，逐行打印到控制台，用户可见"Downloading …"进度，不再像死机）。
+> 设计文档：`docs/Veda一键脚本设计文档.md`（v2.3.16）。本脚本严格按设计文档实现：多平台、持久化免重装、**安装/启动自动分流**、全自动、优先魔搭下载能力、结构化日志 + 诊断包；v2.3.7 含首次魔搭实例实测反馈修复（模型下载落点 / hf 兜底源链 / 阶段级快速跳过 / `--only` 单环节执行），v2.3.8 含全量自检修正（P8 已运行守护与会话脱离、tarball 幂等标记、通用源链 HF 直连兜底等），v2.3.9 含无 GPU 交互继续，v2.3.10 将同类"可询问跳过"扩展到 E102（算力不足）与 E601（外来 ComfyUI），并修正 `compute_cap_ok` 死代码、诊断包 Windows 分隔符等自检问题；v2.3.11 含 P8 启动诚实化修复（启动崩溃/超时不再谎报成功：崩溃抛 E701 + 就地打印 `run/comfyui.log` 尾部，超时诚实标记未就绪；launch 预检补 CUDA 可用性早期信号）；v2.3.12 含同类"谎报/不完整"缺陷修复（`final_summary` 三态——未启动不再谎报可访问 URL；`verify_safetensors_header` 数据段完整性防"下载不完整却判定成功"；`download_model_asset` 回收完整文件 + 清理半截 target；损坏 `.git` 自动重建）；v2.3.13 含 torch 运行时不兼容早暴露（launch 预检 torch<2.0 缺 `custom_op` 直接 E701 给清晰原因，install 验收同步 WARN）；v2.3.14 含启动前置硬门禁（`phase8_launch` 进入即综合判定 venv+torch+cuda，`strict=True` 环境不满足直接 E701 且不 spawn 必崩进程，`strict=False` 安装段顺带启动则跳过并诚实汇报，final_summary 据 `launch_skipped_reason` 明确"未启动（环境不满足）"并指引换 GPU 镜像）；v2.3.15 含 **P2 venv 创建健壮性 + 非 CUDA 后端（AMD ROCm）识别**（回应实测 `python3 -m venv` 因 ensurepip 不可用退出码 1 致 `FATAL/unexpected` 崩溃且丢失真实报错：`ensure_venv` 改为标准→`--without-pip`→回退系统 Python 三级尝试并捕获真实 stderr、永不抛错，回退时置 `ctx.venv_fallback` 且 P2 跳过 `requirements.txt` 安装以保护系统环境；`_launch_precheck` 新增 `torch.version.hip` 识别，ROCm 等"非 CUDA 后端"直接诚实跳过启动并提示换 NVIDIA CUDA 镜像）；v2.3.16 含 **P2 依赖安装静默卡死修复**（回应实测"复用 venv 后 `P2/venv 复用已有 venv` 之后长时间无任何日志"：`capture_output=True` 把 pip 输出全吞且超时 1800s，源慢/不可达时像死机；现新增 pip 源可达性预检——pypi.org 不可达则立即报 E203 并指引配置镜像源（如 `pip config set global.index-url https://mirrors.aliyun.com/pypi/simple/`），不再静默卡 30 分钟；并将 pip 安装改为实时流式输出，逐行打印到控制台，用户可见"Downloading …"进度，不再像死机）。v2.3.18 含 **AMD/ROCm（魔搭 AMD 实例）一键支持**：新增 `amd`（BF16 满血，HBM≥80GB）与 `amd-int8`（int8_convrot + 开启 ROCm Triton 后端，HBM 24–80GB）两档，auto 按实测 HBM 自动二选一；`--system-site-packages` 继承魔搭镜像预装 ROCm torch（避免 pip 装回 CUDA 版 → `Found no NVIDIA driver`）、`requirements.txt` 剔除 `torch*` 行、卸载 SageAttention（ROCm 7.2 下 Triton 编译必崩）、启动注入 AMD 优化环境变量（`HSA_OVERRIDE_GFX_VERSION=9.4.2` 等）与 `--highvram`/`--enable-triton-backend` 等参数；AMD 不使用 Veda（Veda 是 NVIDIA nvfp4 专属），改用 ComfyUI 原生 MiniMaxH3 节点（ComfyUI 0.36.0+ 内置，无需额外节点包）。
 
 📚 配套文档：**使用说明** `docs/使用说明.md` ｜ **问题排错** `docs/问题排错.md`
 
@@ -37,6 +37,30 @@ bash veda-setup/install.sh
 bash install.sh   # 走 MLX 后端，模型权重以 ComfyUI 官方支持为准
 ```
 
+### 魔搭 AMD 实例（ROCm，v2.3.18 新增）
+魔搭 AMD 活动实例（如 MI300X/gfx942，约 192GiB HBM）已预装 ROCm 版 PyTorch。`auto` 档会按实测 HBM 自动选择：
+
+- **HBM ≥ 80GB** → `amd`（BF16 满血 DiT + BF16 文本编码器，最佳画质/速度）
+- **HBM 24–80GB** → `amd-int8`（int8_convrot 权重 + 开启 ROCm Triton 后端加速）
+
+```bash
+cd /mnt/workspace
+bash veda-setup/install.sh           # auto：AMD 实例自动选 amd/amd-int8
+# 或显式指定：
+python veda-setup/setup_veda.py --profile amd        # 大显存 BF16 满血
+python veda-setup/setup_veda.py --profile amd-int8   # 小显存 int8 + Triton
+```
+
+脚本为 AMD 路径做了关键适配（否则必崩）：
+
+1. **继承系统 ROCm torch**：venv 用 `--system-site-packages`，并剔除 `requirements.txt` 里的 `torch*` 行，避免 pip 装回 CUDA 版（典型报错 `Found no NVIDIA driver`）。
+2. **卸载 SageAttention**：ROCm 7.2 下其 Triton kernel 编译失败、采样第一步即崩，ComfyUI 自动回退 PyTorch attention。
+3. **AMD 优化环境变量**：`HSA_OVERRIDE_GFX_VERSION=9.4.2`、`PYTORCH_TUNABLEOP_ENABLED=1`（编译缓存持久化到云盘 `run/../.cache/torch_tunableop`）、`MIOPEN_FIND_MODE=FAST` 等。
+4. **启动参数**：`amd` 仅 `--highvram`；`amd-int8` 加 `--enable-triton-backend --disable-smart-memory --disable-xformers --use-pytorch-cross-attention`。
+5. **不用 Veda**：Veda 是 NVIDIA nvfp4 专属；AMD 走 ComfyUI 原生 MiniMaxH3 节点（`MiniMaxH3ImageToVideo` 等，ComfyUI 0.36.0+ 内置），在 UI 模板库直接加载 MiniMax-H3 工作流（T2V / ReferenceToVideo）即可。
+
+> 参考实践：魔搭社区两篇部署手记（BF16 满血 / int8+Triton 低显存）。详见脚本内 `lib/platform.py`、`lib/phases.py` 的 `rocm` 分支与 `assets_manifest.json` 的 `h3-*-bf16` / `h3-*-int8` 资产条目。
+
 ## 2. 常用参数
 
 | 参数 | 说明 | 默认 |
@@ -44,7 +68,7 @@ bash install.sh   # 走 MLX 后端，模型权重以 ComfyUI 官方支持为准
 | `--install-root PATH` | 安装根目录 | 自动探测（魔搭 → `/mnt/workspace/comfyui-veda`） |
 | `--mode NAME` | 运行模式：`auto`=自动判定（已安装仅启动 / 未安装安装+启动）；`install`=强制安装段（幂等增量）；`launch`=强制仅启动 | `auto` |
 | `--only pN[,pN]` | 单环节执行：`--only p5` 补模型、`--only p1,p3` 重装 ComfyUI+节点；P0 前置、不改 `install_completed`、未含 p8 不启动 | 无 |
-| `--profile NAME` | `minimal`/`standard`/`full`/`lowvram`/`auto` | `auto`（按实测 VRAM 选） |
+| `--profile NAME` | `minimal`/`standard`/`full`/`lowvram`/`auto`；AMD/ROCm 实例另加 `amd`(BF16 满血,≥80GB) / `amd-int8`(int8+Triton,24–80GB) | `auto`（按实测 VRAM/HBM 选） |
 | `--skip-models` | 只搭环境不下模型 | false |
 | `--keep-cache` | 下载后保留模型缓存（默认清理省磁盘） | false |
 | `--listen` | 绑定 `0.0.0.0`（默认 `127.0.0.1`） | false |

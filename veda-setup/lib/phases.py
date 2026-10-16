@@ -42,6 +42,7 @@ class Ctx:
         self.args = None
         self.comfyui_dir = None
         self.venv_python = None
+        self.backend = "nvidia"  # v2.3.18：nvidia | rocm；决定 Veda 取舍与启动参数
         self.network_table = {}
         self.gh_proxy_ok = False
         self.system_site_packages = False
@@ -121,7 +122,9 @@ def _launch_precheck(ctx: Ctx) -> "tuple[bool, str]":
     if r.returncode != 0:
         return False, f"torch 导入失败，无法确认 CUDA 可用性：{r.stderr.strip()[:200]}"
     out = r.stdout.strip()
-    if out == "hip":
+    # v2.3.18：ROCm 后端（AMD）放行——AMD 路径不使用 Veda/nvfp4，走 ComfyUI 原生
+    # MiniMaxH3 节点 + BF16/int8 权重，torch.cuda.is_available() 在 ROCm 下亦为 True。
+    if out == "hip" and ctx.backend != "rocm":
         return False, ("检测到非 CUDA 后端（AMD ROCm：torch.version.hip 存在），"
                       "Veda 依赖 NVIDIA CUDA（如 nvfp4），无法在此环境运行"
                       "（请切换到 NVIDIA CUDA 镜像）")
@@ -171,6 +174,9 @@ def is_installed(ctx: Ctx) -> bool:
             and os.path.isdir(os.path.join(ctx.comfyui_dir, ".git"))):
         return False
     veda = os.path.join(ctx.comfyui_dir, "custom_nodes", "Veda-on-ComfyUI")
+    # v2.3.18：AMD/ROCm 路径不安装 Veda 节点（Veda 是 NVIDIA 专属），仅要求 ComfyUI 就位
+    if d.get("install_profile") in ("amd", "amd-int8"):
+        return True
     return os.path.isdir(veda) and os.path.isdir(os.path.join(veda, ".git"))
 
 
@@ -209,6 +215,10 @@ def preflight_launch(ctx: Ctx):
     安装不完整抛 PhaseError(701)；auto 模式由上层捕获并降级转安装段。"""
     log = ctx.logger
     ctx.env = platform.detect_platform()
+    # v2.3.18：launch-only 路径也要确定后端（脚本可能未跑 P0 选档）
+    _prof = ctx.state.data.get("install_profile")
+    if _prof in ("amd", "amd-int8") or platform.detect_gpu_backend() == "amd":
+        ctx.backend = "rocm"
     log.info("LP", "env", "轻量预检（launch 路径，只读，不跑磁盘/网络/降档）",
              detail=ctx.env)
     vpy = platform.venv_python(ctx.root)
@@ -317,8 +327,13 @@ def phase0_preflight(ctx: Ctx):
     gpu = platform.detect_gpu()
     if gpu:
         log.info("P0", "gpu", "GPU 检测", detail=gpu)
+        if gpu.get("vendor") == "amd":
+            ctx.backend = "rocm"
+            # 魔搭 AMD 实例：复用系统预装 ROCm torch（防止 pip 装回 CUDA 版 → Found no NVIDIA driver）
+            ctx.system_site_packages = True
+            log.info("P0", "gpu", "检测到 AMD/ROCm GPU，切换 ROCm 后端（不使用 Veda/nvfp4）")
     else:
-        log.warn("P0", "gpu", "未检测到 NVIDIA GPU（CPU 模式不可用）")
+        log.warn("P0", "gpu", "未检测到 GPU（CPU 模式不可用）")
 
     if ctx.args.profile == "auto" or not ctx.args.profile:
         if not gpu:
@@ -333,15 +348,19 @@ def phase0_preflight(ctx: Ctx):
             log.warn("P0", "profile", "无 GPU 沿用 fallback 档", detail=fallback)
         else:
             vram = gpu["vram_gb"]
-            if vram < 16:
+            if ctx.backend == "rocm":
+                # v2.3.18：AMD/ROCm 按 HBM 选 bf16 满血(≥80GB) 或 int8+Triton(24-80GB)
+                ctx.profile_name = "amd" if vram >= 80 else "amd-int8"
+                log.info("P0", "profile", "AMD/ROCm 按 HBM 选档", detail=ctx.profile_name)
+            elif vram < 16:
                 ctx.profile_name = "lowvram"
             elif vram <= 24:
                 ctx.profile_name = "standard"
             else:
                 ctx.profile_name = "full"
             log.info("P0", "profile", "按实测 VRAM 选档", detail=ctx.profile_name)
-            # v2.3.10：GPU 算力不足（< SM80）不再直接 PhaseError(102)，改为询问是否继续
-            if not platform.compute_cap_ok(gpu):
+            # v2.3.10：GPU 算力不足（< SM80）仅 NVIDIA 路径需提示（Veda Triton INT8 后端需 SM80+）
+            if ctx.backend == "nvidia" and not platform.compute_cap_ok(gpu):
                 if not _confirm_continue(ctx,
                         "GPU 计算能力 < SM80（Veda Triton INT8 后端需 SM80+，低算力可能无法出片）。"
                         "仍继续安装？"):
@@ -356,6 +375,10 @@ def phase0_preflight(ctx: Ctx):
     if ctx.profile_name not in profiles:
         raise PhaseError(101, f"未知 profile: {ctx.profile_name}")
     ctx.profile = profiles[ctx.profile_name]
+    # v2.3.18：amd / amd-int8 档位强制 ROCm 后端 + 继承系统 ROCm torch（即使 --profile 显式指定也生效）
+    if ctx.profile.get("amd"):
+        ctx.backend = "rocm"
+        ctx.system_site_packages = True
     # lowvram 需第三方量化授权
     if ctx.profile.get("require_third_party") and not ctx.args.accept_third_party:
         raise PhaseError(403, "lowvram 档需第三方量化权重，请加 --accept-third-party")
@@ -530,10 +553,34 @@ def _pip_install_streaming(ctx, req, logger, overall_timeout=2400, no_output_tim
     return rc, "\n".join(tail)
 
 
+def _rocm_requirements(src_req: str, root: str, log) -> str:
+    """v2.3.18：AMD/ROCm 路径必须剔除 requirements 中以 torch 开头的行（torch / torchvision /
+    torchaudio / torchsde 等），避免 pip 把系统预装的 ROCm torch 覆盖回 CUDA/CPU 版
+    （否则启动报 Found no NVIDIA driver）。返回裁剪后的临时 req 路径。"""
+    outp = os.path.join(root, ".cache", "requirements.rocm.txt")
+    os.makedirs(os.path.dirname(outp), exist_ok=True)
+    try:
+        with open(src_req, encoding="utf-8") as f:
+            lines = f.readlines()
+        kept = [ln for ln in lines if not re.match(r"^\s*torch", ln)]
+        with open(outp, "w", encoding="utf-8") as f:
+            f.writelines(kept)
+        removed = len(lines) - len(kept)
+        log.info("P2", "req", "ROCm：剔除 torch* 行避免覆盖系统 ROCm torch",
+                 detail={"removed": removed, "out": outp})
+    except Exception as e:  # noqa: BLE001
+        log.warn("P2", "req", "ROCm requirements 裁剪失败，回退原文件", detail=str(e)[:160])
+        return src_req
+    return outp
+
+
 def phase2_deps(ctx: Ctx):
     log = ctx.logger
     ctx.venv_python = platform.ensure_venv(ctx.root, ctx.system_site_packages, log, ctx)
     req = os.path.join(ctx.comfyui_dir, "requirements.txt")
+    # v2.3.18：ROCm 路径先裁剪 requirements（去掉 torch* 行，复用系统 ROCm torch）
+    if ctx.backend == "rocm" and os.path.exists(req):
+        req = _rocm_requirements(req, ctx.root, log)
     # v2.3.15：venv 创建失败回退到系统 Python 时，跳过 requirements.txt 安装，
     # 避免 pip 改写/破坏镜像预置的系统环境（如镜像自带的 ROCm torch）。
     if ctx.venv_fallback:
@@ -560,6 +607,16 @@ def phase2_deps(ctx: Ctx):
                 # v2.3.8：二次失败给出明确错误码（此前冒泡为"未预期错误"，无 E203）
                 raise PhaseError(203, f"ComfyUI 依赖安装失败（venv 重建后仍失败）：{tail2[-200:]}")
             log.ok("P2", "venv", "venv 重建并重装完成（REBUILD_VENV）")
+    # v2.3.18：ROCm 路径卸载 SageAttention——其在 ROCm 7.2 下 Triton kernel 编译直接失败，
+    # 采样第一步即崩；ComfyUI 会自动回退 PyTorch attention。
+    if ctx.backend == "rocm" and ctx.venv_python and os.path.exists(ctx.venv_python):
+        try:
+            r = subprocess.run([ctx.venv_python, "-m", "pip", "uninstall", "-y", "sageattention"],
+                               capture_output=True, text=True, timeout=300)
+            log.info("P2", "sage", "ROCm：卸载 sageattention（ROCm7.2 下 Triton kernel 编译崩溃）",
+                     detail={"rc": r.returncode})
+        except Exception as e:  # noqa: BLE001
+            log.warn("P2", "sage", "sageattention 卸载失败（可忽略）", detail=str(e)[:120])
     # Windows triton 修复
     if os.name == "nt":
         r = _run_venv(ctx.venv_python, "import triton; print('ok')", timeout=60)
@@ -573,6 +630,10 @@ def phase2_deps(ctx: Ctx):
 # ---------------------------------------------------------------------------
 def phase3_nodes(ctx: Ctx):
     log = ctx.logger
+    if ctx.backend == "rocm":
+        log.info("P3", "veda", "ROCm 后端跳过 Veda 节点安装（Veda 是 NVIDIA nvfp4 专属；"
+                            "AMD 走 ComfyUI 原生 MiniMaxH3 节点）")
+        return
     veda_dir = os.path.join(ctx.comfyui_dir, "custom_nodes", "Veda-on-ComfyUI")
     repo = next(r for r in ctx.manifest["repos"] if r["id"] == "veda")
     commit = repo.get("commit")
@@ -685,6 +746,9 @@ def _download_profile_assets(ctx: Ctx, predicate):
 
 def phase4_predictors(ctx: Ctx):
     log = ctx.logger
+    if ctx.backend == "rocm":
+        log.info("P4", "predictor", "ROCm 后端跳过 Veda 预测器（AMD 不使用 Veda）")
+        return
     log.info("P4", "start", "预测器权重")
     _download_profile_assets(ctx, lambda a: a["id"].startswith("veda-predictor"))
     log.ok("P4", "done", "预测器就绪")
@@ -718,6 +782,13 @@ def phase5_models(ctx: Ctx):
 # ---------------------------------------------------------------------------
 def phase6_templates(ctx: Ctx):
     log = ctx.logger
+    if ctx.backend == "rocm":
+        # v2.3.18：ROCm 路径无 Veda 节点，MiniMax-H3 工作流模板请直接在 ComfyUI UI 模板库加载
+        # （T2V / ReferenceToVideo），或在 UI 中手动搭建（原生 MiniMaxH3* 节点）。
+        log.info("P6", "template", "ROCm 路径无 Veda 节点；请在 ComfyUI UI 模板库加载 MiniMax-H3 工作流"
+                                   "（T2V / ReferenceToVideo），或手动用原生 MiniMaxH3* 节点搭建")
+        log.ok("P6", "done", "模板阶段完成（ROCm：原生 H3 节点）")
+        return
     wf_dir = os.path.join(ctx.comfyui_dir, "user", "default", "workflows")
     os.makedirs(wf_dir, exist_ok=True)
     veda_dir = os.path.join(ctx.comfyui_dir, "custom_nodes", "Veda-on-ComfyUI")
@@ -783,15 +854,20 @@ def _tail_log(path: str, n: int = 50) -> str:
 def phase7_verify(ctx: Ctx):
     log = ctx.logger
     log.info("P7", "start", "验收")
-    # 1) ComfyUI 版本
+    # 1) ComfyUI 版本（v2.3.18：ROCm 走原生 MiniMaxH3 节点，自 0.36.0 起内置；
+    #    NVIDIA/Veda 维持 0.38.0 兼容性下限）
     ver = _comfyui_version(ctx.comfyui_dir)
-    if ver and _ver_tuple(ver) >= (0, 38, 0):
+    _ver_floor = (0, 36, 0) if ctx.backend == "rocm" else (0, 38, 0)
+    if ver and _ver_tuple(ver) >= _ver_floor:
         log.ok("P7", "version", "ComfyUI 版本达标", detail=ver)
     else:
-        log.warn("P7", "version", "ComfyUI 版本未知/<0.38.0", detail=ver)
+        log.warn("P7", "version", f"ComfyUI 版本未知/<{_ver_floor[1]}.{_ver_floor[2]}", detail=ver)
     # 2) 节点目录
     veda_dir = os.path.join(ctx.comfyui_dir, "custom_nodes", "Veda-on-ComfyUI")
-    if os.path.isdir(veda_dir):
+    if ctx.backend == "rocm":
+        # v2.3.18：ROCm 路径无 Veda 节点；校验 ComfyUI 原生 MiniMaxH3 节点可用性（best-effort）
+        log.ok("P7", "node", "ROCm 路径不依赖 Veda 节点（走 ComfyUI 原生 MiniMaxH3 节点）")
+    elif os.path.isdir(veda_dir):
         log.ok("P7", "node", "Veda 节点目录就位")
     else:
         raise PhaseError(501, "Veda 节点目录缺失")
@@ -801,19 +877,30 @@ def phase7_verify(ctx: Ctx):
     # 3) torch.cuda + triton（v2.3.8：venv 缺失守卫——--only p7 未先跑 P2 的场景，
     #    此前 _run_venv 抛 FileNotFoundError 裸崩；缺失时降级为 WARN 跳过）
     if ctx.venv_python and os.path.exists(ctx.venv_python):
-        r = _run_venv(ctx.venv_python,
-                      "import torch, triton; assert torch.cuda.is_available(); "
-                      "print(torch.cuda.get_device_capability())", timeout=120)
-        if r.returncode == 0:
-            log.ok("P7", "torch", "torch.cuda + triton 可用", detail=r.stdout.strip())
-        else:
-            # v2.3.10：区分"无 CUDA"与"triton 不可用"，避免无 GPU 安装时误报 triton
-            rc = _run_venv(ctx.venv_python, "import torch; print(torch.cuda.is_available())",
-                          timeout=60)
-            if rc.returncode == 0 and rc.stdout.strip().lower() == "false":
-                log.warn("P7", "torch", "torch.cuda 不可用（当前环境无 GPU，运行时需 NVIDIA GPU）")
+        if ctx.backend == "rocm":
+            # ROCm：仅校验 torch.cuda 可用 + 确认走 HIP 后端（不强制 triton）
+            r = _run_venv(ctx.venv_python,
+                          "import torch; assert torch.cuda.is_available(); "
+                          "import torch.version; print('hip' if getattr(torch.version,'hip',None) else 'cuda')",
+                          timeout=120)
+            if r.returncode == 0:
+                log.ok("P7", "torch", "ROCm torch 可用", detail=r.stdout.strip())
             else:
-                log.warn("P7", "torch", "triton 不可用", detail=r.stderr[-200:])
+                log.warn("P7", "torch", "ROCm torch 不可用", detail=r.stderr[-200:])
+        else:
+            r = _run_venv(ctx.venv_python,
+                          "import torch, triton; assert torch.cuda.is_available(); "
+                          "print(torch.cuda.get_device_capability())", timeout=120)
+            if r.returncode == 0:
+                log.ok("P7", "torch", "torch.cuda + triton 可用", detail=r.stdout.strip())
+            else:
+                # v2.3.10：区分"无 CUDA"与"triton 不可用"，避免无 GPU 安装时误报 triton
+                rc = _run_venv(ctx.venv_python, "import torch; print(torch.cuda.is_available())",
+                              timeout=60)
+                if rc.returncode == 0 and rc.stdout.strip().lower() == "false":
+                    log.warn("P7", "torch", "torch.cuda 不可用（当前环境无 GPU，运行时需 NVIDIA GPU）")
+                else:
+                    log.warn("P7", "torch", "triton 不可用", detail=r.stderr[-200:])
         # v2.3.13：torch API 兼容性（comfy_kitchen 需 torch.library.custom_op / torch>=2.0）。
         # 魔搭 venv 复用镜像 torch，若镜像 torch < 2.0 则 ComfyUI 启动即崩；此处明确预警。
         compat_ok, compat_detail = _torch_compat_ok(ctx.venv_python)
@@ -848,13 +935,20 @@ def _smoke(ctx: Ctx):
     port = 8188
     cmd = [ctx.venv_python, os.path.join(ctx.comfyui_dir, "main.py"),
            "--listen", "127.0.0.1", "--port", str(port)]
+    # v2.3.18：ROCm 后端注入 AMD 启动参数 + 环境变量，否则 AMD 实例无头启动不可靠
+    smoke_env = None
+    if ctx.backend == "rocm":
+        cmd += _amd_extra_flags(ctx)
+        smoke_env = os.environ.copy()
+        smoke_env.update(_amd_env_dict(ctx.root))
     logf = os.path.join(ctx.root, "run", "comfyui.log")
     os.makedirs(os.path.dirname(logf), exist_ok=True)
-    proc = subprocess.Popen(cmd, stdout=open(logf, "a"), stderr=subprocess.STDOUT)
+    proc = subprocess.Popen(cmd, stdout=open(logf, "a"), stderr=subprocess.STDOUT,
+                            env=smoke_env)
     try:
-        ok = _poll_object_info(port, 600, "VedaSparseAttention")
+        ok = _poll_object_info(port, 600, _readiness_needle(ctx))
         if ok:
-            log.ok("P7", "smoke", "smoke test 通过：VedaSparseAttention 可见")
+            log.ok("P7", "smoke", "smoke test 通过：" + _readiness_needle(ctx) + " 可见")
         else:
             log.warn("P7", "smoke", "smoke test 超时/未探测到节点（E503，待人工复核）")
     finally:
@@ -868,6 +962,53 @@ def _smoke(ctx: Ctx):
 # ---------------------------------------------------------------------------
 # P8 启动
 # ---------------------------------------------------------------------------
+def _amd_env_dict(root: str) -> dict:
+    """v2.3.18：AMD/ROCm 启动专用环境变量（提升 ROCm 推理稳定性 / 算子编译缓存持久化到云盘）。
+
+    HSA_OVERRIDE_GFX_VERSION=9.4.2 针对魔搭 MI300X(gfx942) 实例；其他 AMD 架构按需调整。
+    """
+    return {
+        "TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL": "1",
+        "PYTORCH_TUNABLEOP_ENABLED": "1",
+        "PYTORCH_TUNABLEOP_PERSISTENT_CACHE_DIR": os.path.join(root, ".cache", "torch_tunableop"),
+        "PYTORCH_HIP_ALLOC_CONF": "garbage_collection_threshold:0.2,max_split_size_mb:2048,expandable_segments:False",
+        "HSA_OVERRIDE_GFX_VERSION": "9.4.2",
+        "HIP_FORCE_DEV_KERN_ARG": "1",
+        "MIOPEN_FIND_MODE": "FAST",
+    }
+
+
+def _amd_env_exports(root: str) -> str:
+    """v2.3.18：Linux 启动脚本中的 export 块。"""
+    return "".join(f"export {k}=\"{v}\"\n" for k, v in _amd_env_dict(root).items())
+
+
+def _amd_env_exports_win(root: str) -> str:
+    """v2.3.18：Windows 启动脚本中的 set 块。"""
+    return "".join(f"set {k}={v}\r\n" for k, v in _amd_env_dict(root).items())
+
+
+def _amd_extra_flags(ctx) -> list:
+    """v2.3.18：AMD/ROCm 启动参数。amd(bf16) 仅 --highvram；amd-int8 额外开启 Triton 后端等。
+
+    --disable-auto-launch 防止无头 AMD 服务器误拉起浏览器（魔搭实例无桌面）。
+    """
+    if ctx.profile_name == "amd-int8":
+        return ["--highvram", "--enable-triton-backend", "--disable-smart-memory",
+                "--disable-xformers", "--use-pytorch-cross-attention",
+                "--disable-auto-launch"]
+    return ["--highvram", "--disable-auto-launch"]
+
+
+def _readiness_needle(ctx: Ctx) -> str:
+    """v2.3.18：就绪探测关键节点。
+
+    NVIDIA/Veda：VedaSparseAttention；AMD/ROCm：走 ComfyUI 原生 MiniMaxH3 节点
+    （MiniMaxH3ImageToVideo，ComfyUI 0.36.0+ 内置，文章 436864 证实无需额外节点包）。
+    """
+    return "MiniMaxH3ImageToVideo" if ctx.backend == "rocm" else "VedaSparseAttention"
+
+
 def _write_run_scripts(ctx: Ctx):
     run_dir = os.path.join(ctx.root, "run")
     os.makedirs(run_dir, exist_ok=True)
@@ -881,12 +1022,19 @@ def _write_run_scripts(ctx: Ctx):
         # start.bat：已运行守护（v2.3.8）+ 新窗口启动；stop.bat：PowerShell 按
         # CommandLine 匹配 main.py 精确停止（旧 taskkill /FI WINDOWTITLE 匹配不到
         # 无窗口的 python.exe，实测不可靠）。
+        amd_flags = " ".join(_amd_extra_flags(ctx))
         start = (
             "@echo off\r\n"
             "curl -s --max-time 3 http://127.0.0.1:8188/object_info >nul 2>&1 && "
             "(echo ComfyUI already running at http://127.0.0.1:8188 & exit /b 0)\r\n"
             f"cd /d \"{ctx.comfyui_dir}\"\r\n"
-            f"start \"ComfyUI\" \"{ctx.venv_python}\" \"{main_py}\" --listen {listen} --port 8188\r\n"
+        )
+        if ctx.backend == "rocm":
+            start += _amd_env_exports_win(ctx.root)
+        start += (
+            f"start \"ComfyUI\" \"{ctx.venv_python}\" \"{main_py}\" --listen {listen} --port 8188 "
+            + (amd_flags + " " if amd_flags else "")
+            + "\r\n"
             "echo ComfyUI starting... log: run\\comfyui.log\r\n"
         )
         stop = (
@@ -901,14 +1049,21 @@ def _write_run_scripts(ctx: Ctx):
             "curl -s --max-time 3 http://127.0.0.1:8188/object_info >/dev/null 2>&1 && echo UP || echo DOWN\r\n"
         )
     else:
+        amd_flags = " ".join(_amd_extra_flags(ctx))
         start = (
             "#!/usr/bin/env bash\n"
             "# 已运行守护（v2.3.8）：UP 即退出，避免二次拉起/端口冲突\n"
             "curl -s --max-time 3 http://127.0.0.1:8188/object_info >/dev/null 2>&1 && "
             "{ echo \"ComfyUI already running (http://127.0.0.1:8188)\"; exit 0; }\n"
+        )
+        # v2.3.18：ROCm 环境变量（提升 AMD 推理稳定性 / TunableOp 编译缓存持久化到云盘）
+        if ctx.backend == "rocm":
+            start += _amd_env_exports(ctx.root)
+        start += (
             f"cd \"{ctx.comfyui_dir}\"\n"
             f"nohup \"{ctx.venv_python}\" \"{main_py}\" --listen {listen} --port 8188 "
-            f">> \"{logf}\" 2>&1 &\n"
+            + (amd_flags + " " if amd_flags else "")
+            + f">> \"{logf}\" 2>&1 &\n"
             "echo $! > \"" + pidf + "\"\n"
             "echo \"ComfyUI starting (pid $(cat \"" + pidf + "\"))... log: " + logf + "\n"
         )
@@ -965,20 +1120,29 @@ def phase8_launch(ctx: Ctx, strict: bool = True):
     listen = "0.0.0.0" if ctx.args.listen else "127.0.0.1"
     cmd = [ctx.venv_python, os.path.join(ctx.comfyui_dir, "main.py"),
            "--listen", listen, "--port", "8188"]
+    # v2.3.18：ROCm 后端注入 AMD 启动参数（--highvram / --enable-triton-backend 等）
+    if ctx.backend == "rocm":
+        cmd += _amd_extra_flags(ctx)
     logf = os.path.join(ctx.root, "run", "comfyui.log")
     os.makedirs(os.path.dirname(logf), exist_ok=True)
+    # v2.3.18：ROCm 启动环境变量（提升 AMD 推理稳定性；TunableOp 缓存持久化到云盘）
+    launch_env = None
+    if ctx.backend == "rocm":
+        launch_env = os.environ.copy()
+        launch_env.update(_amd_env_dict(ctx.root))
     if os.name == "nt":
         # DETACHED_PROCESS + stdout/stderr 重定向到日志（v2.3.8：无控制台时
         # 直接 print 可能异常）
         proc = subprocess.Popen(cmd, creationflags=0x00000008,  # DETACHED_PROCESS
-                                stdout=open(logf, "a"), stderr=subprocess.STDOUT)
+                                stdout=open(logf, "a"), stderr=subprocess.STDOUT,
+                                env=launch_env)
     else:
         # start_new_session=True（v2.3.8）：脱离控制组，终端会话关闭/SIGHUP
         # 不再杀死 ComfyUI（等价 nohup）；日志追加不截断（保留历史便于排错）
         proc = subprocess.Popen(cmd, stdout=open(logf, "a"), stderr=subprocess.STDOUT,
-                                start_new_session=True)
+                                start_new_session=True, env=launch_env)
     # 就绪探测（v2.3.11：超时不得谎报成功）
-    if _poll_object_info(8188, 120, "VedaSparseAttention"):
+    if _poll_object_info(8188, 120, _readiness_needle(ctx)):
         log.ok("P8", "ready", "ComfyUI 就绪", detail="http://127.0.0.1:8188")
         log.ok("P8", "done", "启动完成")
         ctx.launch_ready = True

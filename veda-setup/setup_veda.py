@@ -47,7 +47,8 @@ def parse_args() -> argparse.Namespace:
                         "或 --only p1,p3（重装 ComfyUI+节点）；P0 预检始终前置；"
                         "install_completed 不变更；未含 p8 则不启动")
     p.add_argument("--profile", default="auto",
-                   help="minimal/standard/full/lowvram/auto")
+                   help="minimal/standard/full/lowvram/auto；AMD/ROCm 实例新增 amd(bf16 满血,≥80GB) / "
+                        "amd-int8(int8+Triton,24-80GB)，auto 会按实测 HBM 自动二选一")
     p.add_argument("--source-priority", default="auto",
                    help="下载源优先级（默认 auto 按环境自适应）")
     p.add_argument("--skip-models", action="store_true", help="跳过主模型资产")

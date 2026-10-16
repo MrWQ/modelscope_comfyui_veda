@@ -26,6 +26,20 @@
       "vram_min_gb": 8,
       "require_third_party": true,
       "asset_ids": ["veda-predictor-t2va", "h3-dit-int8", "h3-te-awq", "h3-vae-audio", "h3-vae-video", "h3-turbo-lora"]
+    },
+    "amd": {
+      "desc": "AMD/ROCm BF16 满血（≥80GB HBM，gfx942 实测）：fl2va+ref2va bf16 DiT + bf16 文本编码器 + fp16/fp32 VAE + bf16 8步 turbo（不装 Veda，走 ComfyUI 原生 MiniMaxH3 节点）",
+      "models": true,
+      "vram_min_gb": 80,
+      "amd": true,
+      "asset_ids": ["h3-dit-bf16", "h3-dit-bf16-ref2va", "h3-te-bf16", "h3-vae-audio", "h3-vae-video", "h3-turbo-lora"]
+    },
+    "amd-int8": {
+      "desc": "AMD/ROCm int8_convrot + Triton 后端（24-80GB HBM，次优加速）：fl2va+ref2va int8_convrot DiT + int8 文本编码器 + fp16/fp32 VAE + bf16 8步 turbo（避开 nvfp4 模拟慢 10 倍；不装 Veda）",
+      "models": true,
+      "vram_min_gb": 24,
+      "amd": true,
+      "asset_ids": ["h3-dit-int8", "h3-dit-int8-ref2va", "h3-te-int8", "h3-vae-audio", "h3-vae-video", "h3-turbo-lora"]
     }
   }
 }
